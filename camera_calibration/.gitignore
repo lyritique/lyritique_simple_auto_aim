@@ -1,0 +1,5 @@
+build/
+output/
+images/
+*.o
+*.d

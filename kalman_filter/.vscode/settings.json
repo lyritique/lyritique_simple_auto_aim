@@ -1,0 +1,5 @@
+{
+  "clangd.arguments": [
+    "--compile-commands-dir=/home/lyritique/project/auto_aim/kalman_filter/build"
+  ]
+}
