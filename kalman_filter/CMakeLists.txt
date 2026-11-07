@@ -17,6 +17,7 @@ add_executable(
     src/main.cc
     src/data_interaction.cc
     src/draw.cc
+    src/serial_link.cc
 )
 
 target_include_directories(kalman_filter PRIVATE include/ ${OpenCV_INCLUDE_DIRS})
