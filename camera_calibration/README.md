@@ -65,6 +65,26 @@ python3 tools/make_chessboard.py --cols 12 --rows 9 --square 25 --out chessboard
 - **打印完用尺子实测** 10 个格子的总长再除以 10，把实测值传进 `--square`。
   打印机缩放差 2%，`fx/fy` 就会整体偏 2%——这比角点检测误差大得多。
 
+### 检查直线校正效果
+
+`measure_line_straightness` 会对每张照片的棋盘横线和竖线分别做最佳直线拟合，
+统计内角点到拟合直线的垂直偏差，并生成逐图 CSV 和前后对比图：
+
+```bash
+./build/measure_line_straightness \
+  --images images \
+  --calibration output/calibration.yml \
+  --output line_straightness \
+  --cols 11 --rows 8
+```
+
+- `line_metrics.csv`：每张图的平均偏差、最大偏差及去畸变前后差值。
+- `line_metrics_detail.csv`：每条棋盘横线/竖线的偏差。
+- `comparisons/`：原图和去畸变图的直线拟合叠加对比。
+- `summary.txt`：全部有效照片的平均偏差和最大偏差。
+
+偏差单位是源图像像素，定义为角点到对应横线或竖线最佳拟合直线的垂直距离。
+
 ### 2. 拍 12~20 张不同姿态的照片
 
 ```bash

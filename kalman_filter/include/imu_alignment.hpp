@@ -1,5 +1,5 @@
-# ifndef __IMU__
-# define __IMU__
+# ifndef AUTOAIM_IMU_
+# define AUTOAIM_IMU_
 
 # include <eigen3/Eigen/Eigen>
 # include <vector>

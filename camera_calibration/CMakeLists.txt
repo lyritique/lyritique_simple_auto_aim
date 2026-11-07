@@ -26,3 +26,13 @@ add_executable(
 
 target_include_directories(camera_calibration PRIVATE include/ ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(camera_calibration PRIVATE ${OpenCV_LIBS})
+
+add_executable(
+    measure_line_straightness
+    tools/measure_line_straightness.cpp
+    src/calib_config.cc
+    src/board_detector.cc
+)
+
+target_include_directories(measure_line_straightness PRIVATE include/ ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(measure_line_straightness PRIVATE ${OpenCV_LIBS})

@@ -1,5 +1,5 @@
-# ifndef __ARMOR_DETECTOR__
-# define __ARMOR_DETECTOR__
+# ifndef AUTOAIM_ARMOR_DETECTOR_
+# define AUTOAIM_ARMOR_DETECTOR_
 
 # include <array>
 # include <opencv2/core/types.hpp>

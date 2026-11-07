@@ -1,5 +1,5 @@
-# ifndef __DATA_INTERACTION__
-# define __DATA_INTERACTION__
+# ifndef AUTOAIM_DATA_INTERACTION_
+# define AUTOAIM_DATA_INTERACTION_
 
 # include <array>
 # include <vector>

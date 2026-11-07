@@ -1,5 +1,5 @@
-# ifndef __DRAW__
-# define __DRAW__
+# ifndef AUTOAIM_DRAW_
+# define AUTOAIM_DRAW_
 
 # include "armor_detector.hpp"
 # include "kalman_filter_task.hpp"

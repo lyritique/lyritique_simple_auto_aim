@@ -1,5 +1,5 @@
-# ifndef __KALMAN__
-# define __KALMAN__
+# ifndef AUTOAIM_KALMAN_
+# define AUTOAIM_KALMAN_
 # include <eigen3/Eigen/Eigen>
 # include <vector>
 

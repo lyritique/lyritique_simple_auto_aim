@@ -1,5 +1,12 @@
 build/
 output/
 .workbuddy
-任务说明
+任务说明/
 大作业任务清单.md
+.svg
+output_*/
+tools/
+undis*/
+dis*/
+line*/
+.svg
