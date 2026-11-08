@@ -1,7 +1,7 @@
 # ifndef __AUTO_AIM_TYPE__
 # define __AUTO_AIM_TYPE__
 
-#include "data_interaction.hpp"
+# include "data_interaction.hpp"
 # include <array>
 # include <opencv2/core/types.hpp>
 

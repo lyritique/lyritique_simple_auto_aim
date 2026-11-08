@@ -9,6 +9,20 @@ set(CMAKE_CXX_STANDARD 23)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
 
+set(MVS_ROOT "/opt/MVS" CACHE PATH "Hikrobot MVS SDK root")
+find_path(
+    MVS_INCLUDE_DIR
+    NAMES MvCameraControl.h
+    PATHS "${MVS_ROOT}/include"
+    REQUIRED
+)
+find_library(
+    MVS_CAMERA_LIBRARY
+    NAMES MvCameraControl
+    PATHS "${MVS_ROOT}/lib/64"
+    REQUIRED
+)
+
 add_executable(
     kalman_filter
     src/kalman_filter.cc
@@ -17,9 +31,33 @@ add_executable(
     src/main.cc
     src/data_interaction.cc
     src/draw.cc
+    src/clock_sync.cc
+    src/gimbal_history.cc
+    src/latency_estimator.cc
+    src/mvs_camera.cc
+    src/protocol.cc
+    src/realtime_pipeline.cc
     src/serial_link.cc
 )
 
-target_include_directories(kalman_filter PRIVATE include/ ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(kalman_filter PRIVATE Eigen3::Eigen ${OpenCV_LIBS})
+target_include_directories(
+    kalman_filter
+    PRIVATE
+        include/
+        ${OpenCV_INCLUDE_DIRS}
+        ${MVS_INCLUDE_DIR}
+)
+target_link_libraries(
+    kalman_filter
+    PRIVATE
+        Eigen3::Eigen
+        ${OpenCV_LIBS}
+        ${MVS_CAMERA_LIBRARY}
+        pthread
+)
+set_target_properties(
+    kalman_filter
+    PROPERTIES
+        BUILD_RPATH "${MVS_ROOT}/lib/64"
+)
 
