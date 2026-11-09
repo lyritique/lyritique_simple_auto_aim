@@ -16,7 +16,7 @@
          │                                  ↓
          │                    球坐标 (azi, ele, dist) → 观测噪声 R
          │                                  │
-IMU 四元数 ─→ slerp 对齐(offset 9ms) ──────→ │   ← 目前只做了对齐，还没进滤波
+IMU 四元数 ─→ slerp 对齐(offset 9ms) ──────→ │   ← 转到第 0 帧相机系
                                             ↓
                               9 维 EKF：predict → 匹配 → update
                                             │
@@ -31,20 +31,20 @@ IMU 四元数 ─→ slerp 对齐(offset 9ms) ──────→ │   ← �
 
 ## 目录结构
 
-| 路径 | 职责 | 行数 |
-| --- | --- | ---: |
-| `include/armor_detector.hpp` / `src/armor_detector.cc` | YOLOv8-onnx 推理 + letterbox 反变换 + 解码 + NMS | 103 / 311 |
-| `include/data_interaction.hpp` / `src/data_interaction.cc` | 装甲板物点模板、内参、IPPE 解算、两解消歧、重投影误差 | 110 / 201 |
-| `include/kalman_filter_task.hpp` / `src/kalman_filter.cc` | 9 维 EKF：运动模型、观测模型、id 匹配、更新 | 105 / 389 |
-| `include/imu_alignment.hpp` / `src/imu_alignment.cc` | IMU 读表、lower_bound 定位、四元数 slerp | 39 / 101 |
-| `include/draw.hpp` / `src/draw.cc` | 画检测框、画状态面板 | 48 / 193 |
-| `src/main.cc` | 主循环：时间戳、检测、PnP、喂 EKF、写视频/CSV | 398 |
-| `model/Infantry_fp32.onnx` | 检测模型（9 类机器人数 × 4 色） | — |
-| `material/` | 视频 + IMU 内录 + 内参 + 作业说明 | — |
-| `tools/pnp_sanity.py` | 纯 numpy 的 PnP 自检（角点顺序 / 两解 / 噪声灵敏度） | — |
-| `tools/pnp_log_analyze.py` | 解析 `easySolver()` 的 `sol/rms/n·t/yaw` 日志，算选解翻转率 | — |
-| `tools/avi_probe.py` | 从输出视频抽帧，方便对着帧看检测和状态 | — |
-| `tools/plot_states.py` | 读 CSV 画 9 条状态曲线（WSL，需要 numpy + matplotlib） | — |
+| 路径 | 职责 |
+| --- | --- |
+| `src/app/` | 命令行解析、`--replay/--live` 分发和模式启动 |
+| `src/core/` | `TimestampedFrame`、统一运行配置和公共数据类型 |
+| `src/vision/` | YOLO 检测、装甲板几何、PnP 解算 |
+| `src/estimation/` | 9 维 EKF |
+| `src/runtime/` | 共享帧处理器、实时 Pipeline、离线回放 Pipeline |
+| `src/sensors/` | 相机源接口、MVS 相机、AVI 视频源 |
+| `src/timing/` | 时钟同步、姿态历史、延迟统计、离线 IMU 插值 |
+| `src/transport/` | 64 字节协议和 Linux 串口 |
+| `src/debug/` | 检测框、角点和状态面板绘图 |
+| `tests/` | 协议、串口、时钟、姿态历史和延迟的 CTest 自检 |
+| `model/Infantry_fp32.onnx` | 检测模型 |
+| `material/` | 回放视频和 IMU 内录 |
 
 ## 依赖（WSL / Ubuntu）
 
@@ -63,22 +63,29 @@ sudo apt install -y python3-pip && pip3 install numpy pandas matplotlib
 ## 构建 & 运行
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build -j"$(nproc)"
-./build/kalman_filter
+ctest --test-dir build --output-on-failure
 ```
 
-不带参数时用默认路径（`material/…avi`、`material/…txt`、`output/`），**必须在仓库根目录执行**，
-因为模型路径 `model/Infantry_fp32.onnx` 是相对路径。
-
-想自己指定路径，注意 `main.cc` 的参数解析有几处边界条件不太灵光，
-目前唯一稳妥的写法是**四个参数**：
+回放模式：
 
 ```bash
-./build/kalman_filter "material/2026-05-20_23-57-31 (1).avi" \
-                       "material/2026-05-20_23-57-31.txt" \
-                       "output" \
-                       "dummy"      # 第 4 个参数只是为了让 argc>4 成立
+./build/kalman_filter --replay \
+  --video "material/2026-05-20_23-57-31 (1).avi" \
+  --imu "material/2026-05-20_23-57-31.txt" \
+  --output output
+```
+
+实时模式：
+
+```bash
+./build/kalman_filter --live \
+  --camera-index 0 \
+  --camera-width 1440 \
+  --camera-height 1080 \
+  --serial /dev/ttyUSB0 \
+  --baud 115200
 ```
 
 - 想用 VS Code 的 clangd：`.vscode/settings.json` 里写死了
@@ -99,7 +106,7 @@ cmake --build build -j"$(nproc)"
 > 下面这份清单是对开发过程中某一版代码的记录，**部分问题在 `repairEKF` 分支里已经修掉**；
 > 交付版本的实际指标看报告 `doc/视觉第三周作业_吴作庆.md` 的 1.4 节。
 
-1. **两解消歧实际上是「按 rms 抛硬币」** —— `data_interaction.cc` 里
+1. **两解消歧实际上是「按 rms 抛硬币」** —— 旧 `data_interaction.cc`（现 `pnp_solver.cc`）里
    `if (R.col(0).dot(tvecs) >= 0) continue;` 只丢 `n·t > 0` 的解；而实测日志里
    **所有解都满足 `n·t < 0`**，所以这条几何判据一个解也没拦住，两个 IPPE 解都进门。
    接着 `cost = rms + kyaw·Δyaw²` 里 `kyaw = 0`，于是「选谁」全凭那 0.05~1.2 px 的残差差，
