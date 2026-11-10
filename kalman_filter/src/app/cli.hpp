@@ -14,6 +14,7 @@ struct CliResult
     core::AppConfig config;
     std::string error;
     bool help {};
+    bool list_cameras {};
 };
 
 CliResult parseCommandLine(int argc, char** argv);

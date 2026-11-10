@@ -97,6 +97,11 @@ CliResult parseCommandLine(int argc, char** argv)
             result.help = true;
             continue;
         }
+        if (arg == "--list-cameras")
+        {
+            result.list_cameras = true;
+            continue;
+        }
         if (arg == "--replay")
         {
             result.config.mode = core::RunMode::Replay;
@@ -265,7 +270,11 @@ void printUsage(std::ostream& out)
     out <<
         "用法:\n"
         "  kalman_filter --replay [选项]\n"
-        "  kalman_filter --live [选项]\n\n"
+        "  kalman_filter --live [选项]\n"
+        "  kalman_filter --list-cameras\n\n"
+        "通用选项:\n"
+        "  --list-cameras        列出已连接的 MVS 相机\n"
+        "  --help                显示帮助\n\n"
         "回放选项:\n"
         "  --video PATH          离线视频\n"
         "  --imu PATH            IMU 时间序列\n"
@@ -281,8 +290,7 @@ void printUsage(std::ostream& out)
         "  --serial PATH         串口设备\n"
         "  --baud N              串口波特率\n"
         "  --comm-latency S      通信延迟估计，秒\n"
-        "  --max-distance M      送入 EKF 的最大目标距离\n"
-        "  --help                显示帮助\n";
+        "  --max-distance M      送入 EKF 的最大目标距离\n";
 }
 
 }   // namespace app

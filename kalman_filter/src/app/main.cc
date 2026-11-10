@@ -21,6 +21,11 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    if (cli.list_cameras)
+    {
+        return app::listCameras();
+    }
+
     if (cli.config.mode == core::RunMode::Live)
     {
         return app::runLive(cli.config);

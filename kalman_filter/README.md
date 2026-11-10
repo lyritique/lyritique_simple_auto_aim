@@ -1,74 +1,72 @@
-# kalman_filter 视觉第三周作业
+# auto_aim / kalman_filter
 
-> 一段视频，一份 IMU 四元数，九个状态量。
-。
+基于 YOLO、PnP 和 9 维 EKF 的装甲板状态估计程序。
 
-## 组织架构
+支持两种运行方式：
 
-从「YOLO 检测到的装甲板 4 个角点」到「整车 9 维状态」。
+- `--replay`：读取离线 AVI + IMU 文件，生成带检测和状态叠加的视频与 CSV。
+- `--live`：读取 MVS 工业相机和 C 板云台反馈，实时估计目标状态。
 
-```
-视频帧 ──┬─→ YOLO(onnx) 检测 4 角点 ──→ cornerSubPix 精修（择优）
-         │                                  │
-         │                                  ↓
-         │                        IPPE 解算 4 点 PnP（两解消歧）
-         │                                  │  (x, y, z, yaw)_armor
-         │                                  ↓
-         │                    球坐标 (azi, ele, dist) → 观测噪声 R
-         │                                  │
-IMU 四元数 ─→ slerp 对齐(offset 9ms) ──────→ │   ← 转到第 0 帧相机系
-                                            ↓
-                              9 维 EKF：predict → 匹配 → update
-                                            │
-              ┌─────────────────────────────┼────────────────────────┐
-              ↓                             ↓                        ↓
-   output/output_video.avi         output/data.csv         右上角实时状态量
-   （检测框 / 角点 / 状态）      （9 维状态时间序列）      （pos / vel / yaw / vyaw / r）
+## 数据流
+
+```text
+CameraSource
+  → TimestampedFrame
+  → 按帧时间获取云台姿态
+  → FrameProcessor
+       ├─ YOLO 检测
+       ├─ 角点精修
+       ├─ PnP
+       └─ EKF predict / update
+  → ReplayPipeline：视频 + CSV
+  → RealtimePipeline：实时状态
 ```
 
-状态量：`X = [px, py, pz, yaw, vx, vy, vz, vyaw, r]`
-（整车中心位置、整车朝向、速度、角速度、装甲板旋转半径）
+检测、PnP 和 EKF 都放在共享的 `FrameProcessor` 中，实时与回放不会各维护一套算法。
 
-## 目录结构
+## 目录
 
-| 路径 | 职责 |
-| --- | --- |
-| `src/app/` | 命令行解析、`--replay/--live` 分发和模式启动 |
-| `src/core/` | `TimestampedFrame`、统一运行配置和公共数据类型 |
-| `src/vision/` | YOLO 检测、装甲板几何、PnP 解算 |
-| `src/estimation/` | 9 维 EKF |
-| `src/runtime/` | 共享帧处理器、实时 Pipeline、离线回放 Pipeline |
-| `src/sensors/` | 相机源接口、MVS 相机、AVI 视频源 |
-| `src/timing/` | 时钟同步、姿态历史、延迟统计、离线 IMU 插值 |
-| `src/transport/` | 64 字节协议和 Linux 串口 |
-| `src/debug/` | 检测框、角点和状态面板绘图 |
-| `tests/` | 协议、串口、时钟、姿态历史和延迟的 CTest 自检 |
-| `model/Infantry_fp32.onnx` | 检测模型 |
-| `material/` | 回放视频和 IMU 内录 |
-
-## 依赖（WSL / Ubuntu）
-
-```bash
-sudo apt update
-sudo apt install -y build-essential cmake libopencv-dev libeigen3-dev
-# 画图用（可选）
-sudo apt install -y python3-pip && pip3 install numpy pandas matplotlib
+```text
+src/
+├── app/          命令行、模式分发
+├── core/         统一配置、带时间戳帧
+├── vision/       检测、装甲板几何、PnP
+├── estimation/   9 维 EKF
+├── runtime/      共享处理器、实时/回放 Pipeline
+├── sensors/      相机接口、MVS 相机、AVI 视频源
+├── timing/       时钟同步、姿态历史、延迟统计、离线 IMU
+├── transport/    64 字节协议、Linux 串口
+└── debug/        检测框和状态面板绘图
 ```
 
-- OpenCV ≥ 4.5（用到了 `SOLVEPNP_IPPE`、`solvePnPGeneric`、`dnn`）
+主要配置默认值集中在 `src/core/config.hpp`。检测模型和素材路径相对于运行时工作目录。
+
+## 构建
+
+依赖：
+
+- CMake ≥ 3.16
+- OpenCV ≥ 4.5
 - Eigen ≥ 3.4
-- GCC ≥ 11（`CMakeLists.txt` 里写了 C++23；**如果报 `unknown argument -std=gnu++23`，把
-  `CMAKE_CXX_STANDARD` 改成 20 即可** —— 代码里用到的 `std::string::ends_with` 是 C++20）
-
-## 构建 & 运行
+- GCC 支持 C++23
+- Hikrobot MVS SDK，默认安装在 `/opt/MVS`
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON
+
 cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-回放模式：
+MVS 不在默认位置时：
+
+```bash
+cmake -S . -B build -DMVS_ROOT=/path/to/MVS
+```
+
+## 离线回放
 
 ```bash
 ./build/kalman_filter --replay \
@@ -77,7 +75,24 @@ ctest --test-dir build --output-on-failure
   --output output
 ```
 
-实时模式：
+可选参数：
+
+| 参数 | 含义 |
+|---|---|
+| `--imu-offset-ms MS` | IMU 相对图像的时间偏移，离线默认 `9 ms` |
+| `--max-distance M` | 送入 EKF 的最大目标距离，默认 `2.5 m` |
+| `--help` | 查看完整帮助 |
+
+输出：
+
+| 文件 | 内容 |
+|---|---|
+| `output/output_video.avi` | 检测框、角点和 EKF 状态叠加 |
+| `output/data.csv` | 时间、9 维状态和本帧重投影误差 |
+
+CSV 的历史格式保留下来，因此数据行末尾可能追加数量不固定的重投影误差列。
+
+## 实时模式
 
 ```bash
 ./build/kalman_filter --live \
@@ -88,47 +103,78 @@ ctest --test-dir build --output-on-failure
   --baud 115200
 ```
 
-- 想用 VS Code 的 clangd：`.vscode/settings.json` 里写死了
-  `/home/lyritique/project/auto_aim/kalman_filter/build`，换成你自己的路径，
-  或者直接用 `--compile-commands-dir=build`。
+常用参数：
 
-## 输出
+| 参数 | 含义 |
+|---|---|
+| `--camera-fps F` | 固定相机帧率，`0` 表示不修改 |
+| `--exposure-us US` | 固定曝光时间，`0` 表示不修改 |
+| `--gain G` | 固定增益，负数表示不修改 |
+| `--comm-latency S` | 串口到云台执行延迟估计 |
+| `--max-distance M` | 送入 EKF 的最大目标距离 |
 
-| 文件 | 内容 |
-| --- | --- |
-| `output/output_video.avi` | MJPEG，1440×1080，30 fps。右上角是 9 维状态；黄点是 PnP 用的角点，紫点是精修后的角点 |
-| `output/data.csv` | 每帧一行：`time,valid,px,py,pz,yaw,vx,vy,vz,vyaw,r`，**后面还跟着本帧的若干个重投影误差** |
+按 `Ctrl+C` 安全停止。
 
+当前实时模式只接收数据并估计状态，不会自动生成或发送云台控制指令。`RealtimePipeline::send()` 已预留，后续应在弹道、延迟和安全门限完成后接入。
 
+## 坐标系与时间
 
-## 踩过的坑（历史记录）
+这是最容易出错的部分。
 
-> 下面这份清单是对开发过程中某一版代码的记录，**部分问题在 `repairEKF` 分支里已经修掉**；
-> 交付版本的实际指标看报告 `doc/视觉第三周作业_吴作庆.md` 的 1.4 节。
+```text
+图像系：左上角原点，x 右、y 下
+相机系 C：x 右、y 下、z 前
+C 板反馈 q：相机系 → C 板参考世界系
+算法世界 C0：初始化帧的相机坐标系
+```
 
-1. **两解消歧实际上是「按 rms 抛硬币」** —— 旧 `data_interaction.cc`（现 `pnp_solver.cc`）里
-   `if (R.col(0).dot(tvecs) >= 0) continue;` 只丢 `n·t > 0` 的解；而实测日志里
-   **所有解都满足 `n·t < 0`**，所以这条几何判据一个解也没拦住，两个 IPPE 解都进门。
-   接着 `cost = rms + kyaw·Δyaw²` 里 `kyaw = 0`，于是「选谁」全凭那 0.05~1.2 px 的残差差，
-   而两解的 yaw 差 60~220° —— 选解在相邻帧之间来回翻，这就是 yaw 台阶跳变的直接原因。
-   证据与修法见 [docs/PNP排查记录.md](docs/PNP排查记录.md)。
-2. **`previous_yaw` 从来没被更新** —— `pnpSolver::input()` 只清空输出，不记上次的 yaw。
-   想让上面的 `kyaw` 起作用，必须先补上 `previous_yaw = best_yaw;`，
-   否则 cost 会变成「惩罚 yaw 偏离 0」，越用越歪。
-3. **CSV 列数不齐** —— 表头 11 列，数据行后面又追加了 0~2 个重投影误差，
-   还有 `csv << image_time << "偏离过大"` 这种**不带逗号**的行。
-   `pandas.read_csv` 会直接报错或者读出一堆 NaN —— 这大概就是你看到「CSV 没有数据」的原因。
-   `tools/plot_states.py` 用了容错解析，先顶着用。
-4. **IMU 只对齐、没进滤波** —— `alignImuToImage()` 的返回值 `cam_imu` 算出来就扔了。
-   `yaw_odom` / `yaw_kf` 两条曲线目前是空的。
-5. **`init()` 假设「第一眼看到的就是 0 号板」** —— `measurement.testResult.id = 0` 写死。
-   四块板 yaw 差 90°，押错了整车 yaw 就整体偏 90°。而 `id_list` 的 0 号是从
-   `storedID{}` 默认值来的，不是真的匹配出来的。
-6. **`P *= 0.1`** 把位置方差和 yaw 方差都设成 0.1，量纲都不管了；`r` 的方差被写成
-   `kRadiusSigma² = 1e-4`，`p_r = 1e-5`，于是 `r` 卡死在 0.26 附近（CSV 里 `r` 全程
-   0.248~0.260），等于把「装甲板半径」当已知量，白丢一个自由度。
-7. **`reset()` 会把 `F` 清成零矩阵**，而 `F` 只在构造函数里 `setIdentity()` 过一次。
-   注释里写「多次偏离应该 reset」——**一旦真调用 reset，predict 立刻失效**。
-8. **命令行参数解析**：`argc > 4` 才读 `args[3]` 当输出目录，而 `args[2]` 才是输出目录。
+相对旋转：
 
+```text
+R_C0C = q_init⁻¹ · q(t)
+p_C0 = R_C0C · p_camera
+```
 
+装甲板 yaw：
+
+```text
+yaw = atan2(n_C0.x, n_C0.z)
+```
+
+当前 EKF 约定：
+
+```text
+水平面：x-z
+竖直轴：y
+正 yaw：+z 转向 +x
+```
+
+实时模式使用 `ClockSync + GimbalFeedbackHistory`：
+
+1. 把 C 板 DWT 时间映射到上位机单调时钟。
+2. 用相机帧时间查询前后两个反馈样本。
+3. 在历史区间内做四元数 SLERP 和标量插值。
+4. 图像对齐不使用未来外推；未来外推只允许用于控制预测，并有最大时长限制。
+
+## 当前限制
+
+- MVS 封装已保存设备时间戳、SDK 主机时间戳和曝光时间，但当前用于查询姿态的主时间仍是 `MV_CC_GetImageBuffer` 返回时刻。上机后需要确认 SDK 时间戳单位并标定到曝光时刻。
+- 实时相机的分辨率、曝光、增益和焦距必须与内参标定时一致。
+- C 板反馈中的 `DWT_stamp` 当前按 32 位微秒、可回绕处理。
+- 相机杆臂和真实安装外参尚未建模；当前假设 C 板给出的 `q` 已经完成相机姿态换算。
+- `total_delay = process_latency + comm_latency + fly_time` 的统计框架已具备，但通信延迟和飞行时间仍需现场测量或由弹道模块提供。
+- 实时模式不会自动发送控制指令，避免在时间同步和弹道未验证时产生危险动作。
+
+## 测试
+
+CTest 覆盖：
+
+- 64 字节协议打包、解包和校验
+- 伪终端半包、垃圾字节和串口恢复
+- DWT 时间回绕与时钟映射
+- 姿态历史插值、历史边界和短时预测
+- 处理、通信、飞行时间及总延迟统计
+
+```bash
+ctest --test-dir build --output-on-failure
+```
