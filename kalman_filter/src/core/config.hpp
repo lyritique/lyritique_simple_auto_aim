@@ -23,6 +23,17 @@ struct CameraConfig
     float frame_rate {};
     float exposure_time_us {};
     float gain {-1.0F};
+
+    // 时间戳策略：把相机设备时钟映射到主机单调钟。
+    bool use_device_timestamp {true};
+    // 台架测出的常数偏差，正值表示把帧时间往后挪（µs）。
+    double timestamp_offset_us {0.0};
+    // 设备戳落在曝光区间的比例：0=曝光开始，0.5=中点，1=结束。
+    float exposure_anchor {0.5F};
+    // 尝试开启 Chunk-Exposure 拿每帧曝光时间；不支持就自动退回。
+    bool chunk_exposure {true};
+    // 打印时钟校准结果和每帧时间戳，台架实验用。
+    bool timing_log {false};
 };
 
 struct DetectorConfig

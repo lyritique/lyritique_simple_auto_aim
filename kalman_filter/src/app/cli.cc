@@ -232,6 +232,62 @@ CliResult parseCommandLine(int argc, char** argv)
             }
             continue;
         }
+        if (arg == "--camera-time-source")
+        {
+            const auto* value = requireValue();
+            if (!value) break;
+            if (*value == "host")
+            {
+                result.config.camera.use_device_timestamp = false;
+            }
+            else if (*value == "device")
+            {
+                result.config.camera.use_device_timestamp = true;
+            }
+            else
+            {
+                result.error = "时间源只能是 host 或 device: " + *value;
+                break;
+            }
+            continue;
+        }
+        if (arg == "--camera-time-offset-us")
+        {
+            const auto* value = requireValue();
+            if (!value) break;
+            if (!parseDouble(
+                    *value,
+                    result.config.camera.timestamp_offset_us))
+            {
+                result.error = "无效的时间偏移: " + *value;
+                break;
+            }
+            continue;
+        }
+        if (arg == "--camera-exposure-anchor")
+        {
+            const auto* value = requireValue();
+            if (!value) break;
+            float anchor = 0.0F;
+            if (!parseFloat(*value, anchor) || anchor < 0.0F ||
+                anchor > 1.0F)
+            {
+                result.error = "曝光锚点必须在 0~1 之间: " + *value;
+                break;
+            }
+            result.config.camera.exposure_anchor = anchor;
+            continue;
+        }
+        if (arg == "--no-chunk-exposure")
+        {
+            result.config.camera.chunk_exposure = false;
+            continue;
+        }
+        if (arg == "--camera-timing-log")
+        {
+            result.config.camera.timing_log = true;
+            continue;
+        }
         if (arg == "--max-distance")
         {
             const auto* value = requireValue();
@@ -287,6 +343,11 @@ void printUsage(std::ostream& out)
         "  --camera-fps F        设置相机帧率，0 表示不修改\n"
         "  --exposure-us US      设置曝光时间，0 表示不修改\n"
         "  --gain G              设置增益，负数表示不修改\n"
+        "  --camera-time-source S  host 或 device，默认 device\n"
+        "  --camera-time-offset-us US  帧时间常数偏移，台架标定用\n"
+        "  --camera-exposure-anchor R  设备戳在曝光区间的比例，0~1，默认 0.5\n"
+        "  --no-chunk-exposure   关闭 Chunk-Exposure，不读每帧曝光\n"
+        "  --camera-timing-log   打印时钟校准结果和每帧时间戳\n"
         "  --serial PATH         串口设备\n"
         "  --baud N              串口波特率\n"
         "  --comm-latency S      通信延迟估计，秒\n"

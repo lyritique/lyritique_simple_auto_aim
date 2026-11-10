@@ -110,8 +110,21 @@ CSV 的历史格式保留下来，因此数据行末尾可能追加数量不固�
 | `--camera-fps F` | 固定相机帧率，`0` 表示不修改 |
 | `--exposure-us US` | 固定曝光时间，`0` 表示不修改 |
 | `--gain G` | 固定增益，负数表示不修改 |
+| `--camera-time-source S` | `device` 用相机硬件戳，`host` 用收帧时刻；默认 `device` |
+| `--camera-time-offset-us US` | 时间戳常数偏移，台架标定后写入 |
+| `--camera-exposure-anchor R` | 设备戳在曝光区间的比例：`0` 开始、`0.5` 中点、`1` 结束 |
+| `--no-chunk-exposure` | 关闭 Chunk-Exposure，不读每帧曝光 |
+| `--camera-timing-log` | 打印时钟校准结果和每帧时间戳 |
 | `--comm-latency S` | 串口到云台执行延迟估计 |
 | `--max-distance M` | 送入 EKF 的最大目标距离 |
+
+时间戳来源：
+
+1. `open()` 后 `MV_CC_GetImageBuffer` 之前，相机已经 `StartGrabbing`，此时读 `DeviceTimestamp` 节点，与 `steady_clock` 配对采样 24 次，取中位数得到钟差。
+2. 每帧把 `nDevTimeStampHigh/Low` 换算到主机单调钟，作为 `frame.timestamp`。
+3. 校准失败、节点不支持或读数为 0 时自动退回收帧时刻，不影响取流。
+4. 设备戳落在曝光区间的哪个位置需要台架实测：改曝光时间看「收帧时刻 − 映射时刻」是否变化，然后设置 `--camera-exposure-anchor`。
+5. 绝对偏差用 `--camera-time-offset-us` 吸收，正值表示把帧时间往后挪。
 
 按 `Ctrl+C` 安全停止。
 
@@ -158,7 +171,7 @@ yaw = atan2(n_C0.x, n_C0.z)
 
 ## 当前限制
 
-- MVS 封装已保存设备时间戳、SDK 主机时间戳和曝光时间，但当前用于查询姿态的主时间仍是 `MV_CC_GetImageBuffer` 返回时刻。上机后需要确认 SDK 时间戳单位并标定到曝光时刻。
+- MVS 封装默认把相机 `DeviceTimestamp` 映射到主机单调钟作为帧时间；校准失败时退回收帧时刻。设备戳对应曝光开始/中点/结束的哪一种，仍需台架实测后通过 `--camera-exposure-anchor` 指定。
 - 实时相机的分辨率、曝光、增益和焦距必须与内参标定时一致。
 - C 板反馈中的 `DWT_stamp` 当前按 32 位微秒、可回绕处理。
 - 相机杆臂和真实安装外参尚未建模；当前假设 C 板给出的 `q` 已经完成相机姿态换算。

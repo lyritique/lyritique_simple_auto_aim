@@ -63,12 +63,29 @@ private:
         const MvsCameraConfig& config,
         std::string* error);
 
+    // 设备时钟 -> 主机单调钟：读节点配对采样，求钟差。
+    bool calibrateDeviceClock(std::string* error);
+    bool readDeviceTimestamp(uint64_t& ticks, std::string* error) const;
+    double deviceTicksToHost(uint64_t ticks) const;
+
+    // 尽力打开 Chunk-Exposure；失败只警告，不影响取流。
+    bool enableChunkExposure(std::string* warning);
+
     MvsCameraConfig config_;
     void* handle_ {};        // SDK 设备句柄
     bool grabbing_ {};       // 是否已开始取流
     bool sdk_acquired_ {};   // 是否持有 SDK 引用计数
     SourceInfo info_;
     std::string last_error_;
+
+    // 时间戳与 chunk 状态
+    bool chunk_active_ {};
+    unsigned int chunk_bits_per_pixel_ {};
+    bool clock_ready_ {};
+    double clock_scale_ {1e-9};    // 设备 tick -> 秒
+    double clock_offset_ {};       // host = device 秒 + offset
+    double clock_spread_ms_ {};    // 校准样本极差，诊断用
+    double last_frame_timestamp_ {};
 };
 
 }   // namespace camera

@@ -7,9 +7,11 @@
 # include <chrono>
 # include <cstring>
 # include <iomanip>
+# include <iostream>
 # include <limits>
 # include <mutex>
 # include <sstream>
+# include <thread>
 # include <vector>
 
 namespace camera
@@ -122,6 +124,14 @@ void fillDeviceInfo(const DeviceInfo& device, CameraInfo& out)
     out.user_name = fixedString(
         device.chUserDefinedName,
         sizeof(device.chUserDefinedName));
+}
+
+// 从像素类型里抠出“每像素占多少 bit”，8/12/16/24 都能算。
+unsigned int pixelBits(MvGvspPixelType type)
+{
+    return (static_cast<unsigned int>(type) &
+            MV_GVSP_PIX_EFFECTIVE_PIXEL_SIZE_MASK) >>
+           MV_GVSP_PIX_EFFECTIVE_PIXEL_SIZE_SHIFT;
 }
 
 CameraInfo toCameraInfo(
@@ -360,6 +370,21 @@ bool MvsCamera::open(std::string* error)
         return rollback(reason);
     }
 
+    if (config_.chunk_exposure)
+    {
+        std::string warning;
+        if (!enableChunkExposure(&warning))
+        {
+            std::clog << "警告: " << warning
+                      << "，每帧曝光时间不可用\n";
+        }
+    }
+    else
+    {
+        // 上次进程可能把 ChunkMode 留成开着的，先确认关掉，否则帧长会变。
+        MV_CC_SetBoolValue(handle_, "ChunkModeActive", false);
+    }
+
     //开闸，开始出图
     ret = MV_CC_StartGrabbing(handle_);
     if (ret != MV_OK)
@@ -369,6 +394,27 @@ bool MvsCamera::open(std::string* error)
     }
 
     grabbing_ = true;
+
+    // 取流开始后再标定，万一 StartGrabbing 让设备戳归零也能兜住。
+    if (config_.use_device_timestamp)
+    {
+        std::string clock_error;
+        if (!calibrateDeviceClock(&clock_error))
+        {
+            std::clog << "警告: 设备时钟校准失败（" << clock_error
+                      << "），退回收帧时刻\n";
+        }
+    }
+
+    if (config_.timing_log)
+    {
+        std::clog << "[相机时钟] mode="
+                  << (clock_ready_ ? "device" : "host")
+                  << " ns/tick=" << clock_scale_ * 1e9
+                  << " offset=" << clock_offset_
+                  << " spread=" << clock_spread_ms_ << " ms\n";
+    }
+
     // 先记配置值顶一下；真实宽高要等第一帧到了才准。
     info_.width = config_.width;
     info_.height = config_.height;
@@ -395,8 +441,7 @@ core::FrameReadStatus MvsCamera::read(
         &raw,
         static_cast<unsigned int>(
             std::max(1, config_.timeout_ms)));
-    // 注意：这是“帧已经躺进内存”的时刻（t_frame_out），不是曝光时刻（t_exp）。
-    // 真要曝光时刻，得用 device_timestamp 或 chunk，别拿它凑合。
+    // 收帧时刻只当兜底：设备时钟校准成功后，会用相机自己的戳。
     const double host_time = steadyNowSeconds();
 
     if (ret != MV_OK)
@@ -420,8 +465,19 @@ core::FrameReadStatus MvsCamera::read(
         info.nExtendWidth != 0 ? info.nExtendWidth : info.nWidth;
     const unsigned int height =
         info.nExtendHeight != 0 ? info.nExtendHeight : info.nHeight;
-    const std::size_t source_size =
+    std::size_t source_size =
         info.nFrameLenEx != 0 ? info.nFrameLenEx : info.nFrameLen;
+    if (chunk_active_ && chunk_bits_per_pixel_ > 0)
+    {
+        // 开 chunk 后 nFrameLenEx 尾巴上挂着元数据，转换只能喂图像本身。
+        const std::size_t image_size =
+            (static_cast<std::size_t>(width) * height *
+                 chunk_bits_per_pixel_ + 7) / 8;
+        if (image_size > 0 && image_size <= source_size)
+        {
+            source_size = image_size;
+        }
+    }
 
     if (width == 0 || height == 0 || raw.pBufAddr == nullptr)
     {
@@ -501,19 +557,66 @@ core::FrameReadStatus MvsCamera::read(
         }
     }
 
-    // 时间戳三件套，各说各话，别混着算：
-    //   timestamp          主机单调钟的“收帧”时刻，算法目前用它
-    //   device_timestamp   相机自己的硬件戳，单位和零点要现场标定
-    //   sdk_host_timestamp SDK 打的主机戳，仍是收帧时刻，不是曝光时刻
-    frame.timestamp = host_time;
-    frame.time_domain = core::TimeDomain::HostMonotonic;
-    frame.device_timestamp =
+    const uint64_t device_ticks =
         (static_cast<uint64_t>(info.nDevTimeStampHigh) << 32) |
         static_cast<uint64_t>(info.nDevTimeStampLow);
+
+    // Chunk-Exposure 没开成时，退回配置里的固定曝光，至少能做中点修正。
+    const float exposure_us =
+        info.fExposureTime > 0.0F
+            ? info.fExposureTime
+            : config_.exposure_time_us;
+
+    double stamp = host_time;
+    if (config_.use_device_timestamp && clock_ready_ && device_ticks != 0)
+    {
+        stamp = deviceTicksToHost(device_ticks);
+
+        // anchor=0 表示戳在曝光开始，0.5 在中点，1 在结束。
+        if (exposure_us > 0.0F)
+        {
+            stamp +=
+                (0.5 - static_cast<double>(config_.exposure_anchor)) *
+                static_cast<double>(exposure_us) * 1e-6;
+        }
+
+        // 映射时刻不可能晚于收帧时刻，也不该掉到很久以前。
+        // 超出 1 秒说明设备戳复位或校准坏了，直接回退。
+        if (stamp > host_time || stamp < host_time - 1.0)
+        {
+            stamp = host_time;
+        }
+
+        // 设备戳回绕/复位时保底，不能喂给 EKF 倒退或相等的时间。
+        if (last_frame_timestamp_ > 0.0 &&
+            stamp <= last_frame_timestamp_)
+        {
+            stamp = std::max(
+                host_time, last_frame_timestamp_ + 1e-6);
+        }
+    }
+    last_frame_timestamp_ = stamp;
+
+    if (config_.timing_log)
+    {
+        std::clog << "[帧] n=" << info.nFrameNum
+                  << " dev=" << device_ticks
+                  << " mapped=" << stamp
+                  << " recv=" << host_time
+                  << " lag_us=" << (host_time - stamp) * 1e6
+                  << " exp_us=" << exposure_us << '\n';
+    }
+
+    // 时间戳三件套，各说各话，别混着算：
+    //   timestamp          映射到主机单调钟的相机事件时刻
+    //   device_timestamp   相机自己的原始硬件戳，留着排查
+    //   sdk_host_timestamp SDK 打的主机戳，仍是收帧时刻
+    frame.timestamp = stamp;
+    frame.time_domain = core::TimeDomain::HostMonotonic;
+    frame.device_timestamp = device_ticks;
     frame.sdk_host_timestamp = info.nHostTimeStamp;
     frame.frame_number = info.nFrameNum;
-    // 不开 Chunk-Exposure 时这货多半是 0，别指望它。
-    frame.exposure_time_us = info.fExposureTime;
+    frame.exposure_time_us = exposure_us;
 
     MV_CC_FreeImageBuffer(handle_, &raw);
 
@@ -555,6 +658,148 @@ void MvsCamera::close()
         releaseSdk();
         sdk_acquired_ = false;
     }
+
+    chunk_active_ = false;
+    chunk_bits_per_pixel_ = 0;
+    clock_ready_ = false;
+    clock_offset_ = 0.0;
+    clock_spread_ms_ = 0.0;
+    last_frame_timestamp_ = 0.0;
+}
+
+bool MvsCamera::readDeviceTimestamp(uint64_t& ticks, std::string* error) const
+{
+    MVCC_INTVALUE_EX value {};
+    const int ret = MV_CC_GetIntValueEx(
+        handle_, "DeviceTimestamp", &value);
+    if (ret != MV_OK)
+    {
+        if (error)
+        {
+            *error = "读 DeviceTimestamp 失败: " + hexCode(ret);
+        }
+        return false;
+    }
+
+    ticks = static_cast<uint64_t>(value.nCurValue);
+    return true;
+}
+
+bool MvsCamera::calibrateDeviceClock(std::string* error)
+{
+    clock_ready_ = false;
+    clock_offset_ = 0.0;
+    clock_spread_ms_ = 0.0;
+
+    // 多数型号的 DeviceTimestamp 直接是 ns；万一按 tick 计，用 Increment 换算。
+    clock_scale_ = 1e-9;
+    MVCC_INTVALUE_EX increment {};
+    if (MV_CC_GetIntValueEx(
+            handle_, "DeviceTimestampIncrement", &increment) == MV_OK &&
+        increment.nCurValue > 0)
+    {
+        clock_scale_ = static_cast<double>(increment.nCurValue) * 1e-9;
+    }
+
+    // 只在读节点的瞬间配对，不掺入图像传输延迟，否则等于没换。
+    constexpr int kSamples = 24;
+    std::vector<double> offsets;
+    offsets.reserve(kSamples);
+    uint64_t first_ticks = 0;
+    uint64_t last_ticks = 0;
+
+    for (int i = 0; i < kSamples; ++i)
+    {
+        const double before = steadyNowSeconds();
+        uint64_t ticks = 0;
+        std::string read_error;
+        if (!readDeviceTimestamp(ticks, &read_error))
+        {
+            if (error) *error = read_error;
+            return false;
+        }
+        const double after = steadyNowSeconds();
+
+        if (i == 0) first_ticks = ticks;
+        last_ticks = ticks;
+
+        offsets.push_back(
+            (before + after) * 0.5 -
+            static_cast<double>(ticks) * clock_scale_);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    if (last_ticks <= first_ticks)
+    {
+        if (error) *error = "DeviceTimestamp 没有走动";
+        return false;
+    }
+
+    std::sort(offsets.begin(), offsets.end());
+    const std::size_t mid = offsets.size() / 2;
+    clock_offset_ = offsets.size() % 2 == 0
+        ? (offsets[mid - 1] + offsets[mid]) * 0.5
+        : offsets[mid];
+    clock_spread_ms_ = (offsets.back() - offsets.front()) * 1000.0;
+    clock_ready_ = true;
+    return true;
+}
+
+double MvsCamera::deviceTicksToHost(uint64_t ticks) const
+{
+    // 正的 timestamp_offset_us 会把帧时间往后挪，台架标定时慢慢拧。
+    return static_cast<double>(ticks) * clock_scale_ + clock_offset_ +
+           config_.timestamp_offset_us * 1e-6;
+}
+
+bool MvsCamera::enableChunkExposure(std::string* warning)
+{
+    chunk_active_ = false;
+    chunk_bits_per_pixel_ = 0;
+
+    MVCC_ENUMVALUE pixel_format {};
+    if (MV_CC_GetEnumValue(
+            handle_, "PixelFormat", &pixel_format) != MV_OK)
+    {
+        if (warning) *warning = "读不到 PixelFormat";
+        return false;
+    }
+
+    const unsigned int bits = pixelBits(
+        static_cast<MvGvspPixelType>(pixel_format.nCurValue));
+    if (bits == 0)
+    {
+        if (warning) *warning = "像素格式未知";
+        return false;
+    }
+
+    if (MV_CC_SetBoolValue(handle_, "ChunkModeActive", true) != MV_OK)
+    {
+        if (warning) *warning = "相机不支持 ChunkModeActive";
+        return false;
+    }
+
+    int ret = MV_CC_SetEnumValueByString(
+        handle_, "ChunkSelector", "Exposure");
+    if (ret == MV_OK)
+    {
+        ret = MV_CC_SetBoolValue(handle_, "ChunkEnable", true);
+    }
+
+    if (ret != MV_OK)
+    {
+        // 半开状态最坑，失败就把 ChunkMode 关回去。
+        MV_CC_SetBoolValue(handle_, "ChunkModeActive", false);
+        if (warning)
+        {
+            *warning = "Chunk-Exposure 设置失败: " + hexCode(ret);
+        }
+        return false;
+    }
+
+    chunk_bits_per_pixel_ = bits;
+    chunk_active_ = true;
+    return true;
 }
 
 bool MvsCamera::fail(
