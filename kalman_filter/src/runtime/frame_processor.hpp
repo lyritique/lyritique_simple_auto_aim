@@ -53,24 +53,31 @@ class FrameProcessor
 {
 public:
     // 作用：按配置把检测器、PnP、EKF 都装配好。实现：初始化列表里拷贝配置并构造检测器，EKF 用默认构造。
+    // 参数：config —— 全局配置，只读借用，内部只挑 detector 和 target_max_distance 用。
+    // 返回：无。此时 EKF 还未初始化，要等第一帧观测来 init。
     explicit FrameProcessor(const core::AppConfig& config);
 
     // 作用：把 EKF 和帧时间记忆全清掉，换视频或重连时用。实现：调 ekf_.reset() 再归零几个标志位。
+    // 参数：无。返回：无。清完就和刚构造出来一样干净。
     void reset();
 
     // R_C0C 把当前相机系观测转到算法世界 C0。
     // 作用：一帧图像进来，走完检测、PnP、坐标旋转、EKF 更新。实现：先预测、再检测、逐块解算择优，最后更新并取状态。
+    // 参数：frame —— 带时间戳的 BGR 帧；R_C0C —— 相机系到算法世界的旋转，正交矩阵，调用方保证。
+    // 返回：本帧的检测、观测账本和滤波状态；EKF 没初始化时 state 字段无效，看 ekf_initialized。
     FrameProcessingResult process(
         const core::TimestampedFrame& frame,
         const Eigen::Matrix3d& R_C0C);
 
     // 作用：把相机内参借给外面画重投影。实现：直接转发 pnp_ 里的 cv::Mat，不改不拷贝。
+    // 参数：无。返回：3x3 内参矩阵的常量引用，生命周期跟本对象走，别存指针。
     const cv::Mat& cameraMatrix() const noexcept
     {
         return pnp_.cameraMatrix();
     }
 
     // 作用：把畸变系数借给外面，画图时去畸变用。实现：同样直接转发。
+    // 参数：无。返回：畸变系数向量的常量引用，同样别越过对象生命周期。
     const cv::Mat& distortionCoeffs() const noexcept
     {
         return pnp_.distortionCoeffs();

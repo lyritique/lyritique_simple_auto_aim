@@ -79,6 +79,8 @@ class RealtimePipeline
 {
 public:
     // 作用：拿配置把整条链路装配好。实现：移动配置，顺手把 ClockSync、历史缓存、帧处理器都按参数构造。
+    // 参数：config —— 全量配置，按值传入，内部 move 进成员；传左值就多一次拷贝（默认值给空配置方便测试）。
+    // 返回：无。此时设备没开、线程没起，真正干活要等 start()。
     explicit RealtimePipeline(RealtimePipelineConfig config = {});
     // 作用：析构时自动收摊，别留半开着的相机和串口。实现：直接调 stop()。
     ~RealtimePipeline();
@@ -88,44 +90,61 @@ public:
     RealtimePipeline& operator=(const RealtimePipeline&) = delete;
 
     // 作用：清状态、开串口、开相机、起反馈线程，一条龙启动。实现：先 stop 再逐步初始化，任一步失败就回滚并报错。
+    // 参数：error —— 可选出错信息出口，非空时失败原因会写进去。
+    // 返回：true 表示设备全开、反馈线程已跑；false 表示没起来，相机和串口都已回滚关闭。
     bool start(std::string* error = nullptr);
     // 作用：主循环，读帧读到外部喊停。实现：轮询相机，超时就下一轮，出错计数，成功就丢给 processFrame。
+    // 参数：external_stop —— 外部停止标志，置 true 后本轮循环退出；callback —— 每帧回调，可空。
+    // 返回：无。正常退出时会顺手调 stop()，不用再手动收拾。
     void run(
         const std::atomic_bool& external_stop,
         FrameCallback callback = {});
     // 作用：不给停止标志的简化版 run，跑到天荒地老。实现：造一个永远为假的 atomic 再转调上面的重载。
+    // 参数：callback —— 每帧回调，可空。返回：无，只能靠进程信号或对象销毁来结束。
     void run(FrameCallback callback = {});
     // 作用：关线程、关相机、关串口，安全退出。实现：清 running_，请求停止并 join 反馈线程，再依次关设备。
+    // 参数：无。返回：无。可重复调用，没启动也不报错。
     void stop();
 
     // 作用：把控制包发回 C 板，当前版本先留着接口。实现：串口 send，失败就记错误。
+    // 参数：packet —— 要下发的视觉指令；error —— 可选出错信息出口。
+    // 返回：true 发送成功；false 串口没开或写失败，细节看 error/last_error_。
     bool send(
         const comm::VisionToGimbal& packet,
         std::string* error = nullptr);
 
     // 作用：拿最近一次有效状态，线程安全。实现：锁内拷贝 latest_state_，valid 一并返回。
+    // 参数：state —— 输出参数，会被覆盖。返回：state.valid，false 表示还没产出过可信状态。
     bool latestState(kalfilter::KFResult& state) const;
     // 作用：拿延迟统计快照。实现：转调 latency_.snapshot()。
+    // 参数：无。返回：三段延迟的统计值，valid 为假时 total_delay 无意义。
     kalfilter::LatencySnapshot latencySnapshot() const;
     // 作用：拿计数器统计。实现：锁内拷贝 stats_。
+    // 参数：无。返回：四类累计计数的一份拷贝，随时可调用。
     PipelineStats stats() const;
     // 作用：只读配置，方便外部查参数。实现：内联返回常量引用，不拷贝。
+    // 参数：无。返回：构造时存下的配置引用，跟随对象生命周期。
     const RealtimePipelineConfig& config() const noexcept { return config_; }
 
 private:
     // 作用：一帧的完整加工：等姿态、算相对旋转、跑处理、记延迟、回调。实现：内部按顺序调用各组件，失败就计数返回。
+    // 参数：frame —— 已读出的帧；callback —— 外部回调，可空。返回：本帧结果，姿态等不到时各字段保持默认。
     PipelineFrameResult processFrame(
         const core::TimestampedFrame& frame,
         const FrameCallback& callback);
     // 作用：等云台历史覆盖到目标时刻，最多等配置的毫秒数。实现：循环尝试插值，睡 1ms 再试，超时或停机就放弃。
+    // 参数：host_time —— 要查的时刻；sample —— 输出姿态。返回：true 拿到姿态，false 超时或链路已停。
     bool waitForAttitude(
         double host_time,
         kalfilter::GimbalSample& sample);
     // 作用：独立线程专收串口反馈。实现：poll 到包就处理，没包就睡 1ms，直到停止请求。
+    // 参数：stop_token —— jthread 的停止令牌。返回：无，线程函数自己跑到停机条件成立。
     void feedbackLoop(std::stop_token stop_token);
     // 作用：把一条原始包变成可用的云台样本并入库。实现：时钟同步、字段拷贝、history_.push、计数。
+    // 参数：packet —— 串口刚收上来的反馈包。返回：无，同步失败或时间不递增就静默丢弃。
     void handleFeedback(const comm::GimbalToVision& packet);
     // 作用：统一记错误并返回失败。实现：写 last_error_，有外部指针就一并带出。
+    // 参数：message —— 错误原因；error —— 可选出错信息出口。返回：恒定 false，方便直接 return fail(...)。
     bool fail(const std::string& message, std::string* error);
 
     // 作用：整条链路的参数总仓。实现：构造时从外部移动进来，之后只读。
