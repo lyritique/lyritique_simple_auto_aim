@@ -5,6 +5,8 @@
 # include <algorithm>
 # include <chrono>
 # include <utility>
+# include <filesystem>
+# include <fstream>
 
 namespace realtime
 {
@@ -110,6 +112,19 @@ void RealtimePipeline::run(
     // 作用：没 start 就别空转。实现：running_ 为假直接返回。
     if (!running_.load()) return;
 
+    std::ofstream csv; 
+    std::error_code ec;
+    std::filesystem::create_directories(config_.output_directory, ec);
+
+    if (!ec)
+    {
+        csv.open(config_.output_directory + "/realtime.csv");
+        if (csv)
+        {
+            csv << "time,valid,px,py,pz,yaw,vx,vy,vz,vyaw,r," << "latency_ms,detections,feedback\r\n";
+        }
+    }
+
     // 作用：两个停止条件都要看：自己不想跑了，或外部喊停。实现：while 同时检查 running_ 和 external_stop。
     while (running_.load() && !external_stop.load())
     {
@@ -119,10 +134,8 @@ void RealtimePipeline::run(
         // 作用：向相机要一帧。实现：read 返回状态码，后续分支处理。
         const auto status = camera_->read(frame, &error);
         // 作用：暂时没图不算错误，下一轮再要。实现：Timeout 就 continue，不计数。
-        if (status == core::FrameReadStatus::Timeout)
-        {
-            continue;
-        }
+        if (status == core::FrameReadStatus::Timeout) continue;
+        
         // 作用：真读坏了才计丢帧并留错误，睡 5ms 防止忙等刷屏。实现：锁内自增 dropped_frames，记错误，再 sleep。
         if (status != core::FrameReadStatus::Ok)
         {
@@ -135,10 +148,24 @@ void RealtimePipeline::run(
         }
 
         // 作用：好帧就进入加工流水线。实现：直接调 processFrame，回调原样透传。
-        processFrame(frame, callback);
+        const PipelineFrameResult result = processFrame(frame, callback);
+
+        if (csv)
+        {
+            csv << result.frame_time << ','
+                << (result.state_valid ? 1 : 0) << ',';
+            for (int i = 0; i < 9; ++i)
+            {
+                csv << result.state.state(i) << ',';
+            }
+            csv << result.process_latency << ','
+                << result.valid_detections << ','
+                << (result.feedback_available ? 1 : 0) << '\r\n';
+        }
     }
 
     // 作用：循环退出说明该收摊了。实现：调 stop() 统一关线程和设备。
+    if (csv) csv.close();
     stop();
 }
 
