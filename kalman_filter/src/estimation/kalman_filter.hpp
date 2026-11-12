@@ -42,6 +42,9 @@ struct KalmanConfig
     double init_sigma_vel {4.0};     // m/s
     double init_sigma_yaw {0.25};    // rad
     double init_sigma_vyaw {6.0};    // rad/s
+
+    // 多久没有新观测就让状态失效。纯靠预测外推越久越离谱，云台会照着空想的角度转。
+    double lost_timeout {0.3};       // s
 };
 
 //相机系球坐标，用于求R观测噪声协方差矩阵，噪声天然的坐标系是 YPD
@@ -101,6 +104,9 @@ class KalmanFilter
         Eigen::Matrix<double,9,9> F {};
 
         bool initialized = false;
+
+        // 距上一次真正吃到观测过了多久，丢目标判定用。
+        double time_since_update_ {};
 
         KalmanConfig config {};
 

@@ -257,6 +257,7 @@ namespace kalfilter
         P(7,7) = sw;
         P(8,8) = config.kRadiusSigma * config.kRadiusSigma;
         initialized = true;
+        time_since_update_ = 0.0;
 
     }
 
@@ -269,14 +270,19 @@ namespace kalfilter
         F.setZero() ;
         id_list.clear() ;
         max_id =0;
+        time_since_update_ = 0.0;
     }
    
 
     void KalmanFilter::predict(const double& dt)
     {
+        // 只要还在预测，就说明这一帧没吃到观测。
+        time_since_update_ += dt;
+
         X.head<3>() += X.segment<3>(4)*dt;
-        //X(3) = wrap(X(7)*dt+X(3));
-        X(3) = X(7)*dt+X(3);
+        // yaw 是角度，必须折回 ±π，否则自旋时状态会一路漂到 ±nπ，
+        // 后面按 id 挑装甲板、算残差都会错位。
+        X(3) = wrap(X(7)*dt+X(3));
 
         //计算雅克布矩阵
         //让它特定位置的4*4块变成单位乘dt，就是根据dt更新了
@@ -347,8 +353,6 @@ namespace kalfilter
         //检查是否过了匹配
         if (!armor.testResult.valid)return;
 
-        std::cout << armor.testResult.id ;
-
         //保存先验，写迭代
         Eigen::Matrix<double, 9, 1> x_iter = x_prior;
 
@@ -418,6 +422,8 @@ namespace kalfilter
 
         //更新X，P
         X = x_iter;
+        // 迭代更新后可能又被推出 ±π，收尾再折一次。
+        X(3) = wrap(X(3));
 
         const Eigen::Matrix<double, 4, 9> H_final =computeH(X, armor.testResult.id);
 
@@ -432,6 +438,9 @@ namespace kalfilter
         P = IKH * P_prior * IKH.transpose()+ K_final * R * K_final.transpose();
 
         P = 0.5 * (P + P.transpose());
+
+        // 真正吃到了观测，丢目标计时清零。
+        time_since_update_ = 0.0;
     }
 
     //这个是每一帧的结束处理id_list的
@@ -455,6 +464,12 @@ namespace kalfilter
         KFResult result;
 
         if (!initialized)
+        {
+            return result;
+        }
+
+        // 太久没观测就别再外推：预测越久越离谱，下游会拿着假状态去转云台。
+        if (time_since_update_ > config.lost_timeout)
         {
             return result;
         }

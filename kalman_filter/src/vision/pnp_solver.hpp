@@ -9,6 +9,8 @@
 # include <opencv2/core/types.hpp>
 # include <eigen3/Eigen/Eigen>
 
+# include "core/config.hpp"
+
 
 /*
 pnp 类
@@ -60,17 +62,7 @@ struct pnpConfig
     };
 
     //video内参   
-    struct camParams 
-    {
-    double width = 1440;
-    double height= 1080;
-    double fx    = 2362.2795952460974;
-    double fy    = 2336.1916035376717;
-    double cx    = 679.17513921636282;
-    double cy    = 529.06858905837635;
-    Eigen::Matrix<double, 5, 1> dist  {-0.098561592108101559, 0.11173066531932681,
-           -0.0038352945867108721, -0.0020421443354436304, 0.0};
-    };
+    // 内参已经从 pnpConfig 搬走，改由 core::IntrinsicsConfig / --calibration 提供。
 
     //解算初筛阈值
     static const constexpr double max_reproj_err {3.0};                                                     //戴帽子大师
@@ -101,7 +93,9 @@ class pnpSolver
 {
     public:
     //构造函数（未写）
-    explicit pnpSolver();
+    // 作用：用外部传入的内参拼出 camera_matrix_ 和畸变系数，不再写死在类里。
+    // 参数：intrinsics —— 来自 AppConfig，可能已经由 --calibration 从标定文件加载。
+    explicit pnpSolver(const core::IntrinsicsConfig& intrinsics);
     void input (const std::array<cv::Point2f, 4>& image_corners, bool big);
     void easySolver();
     void renewPrevious(double& best_yaw);

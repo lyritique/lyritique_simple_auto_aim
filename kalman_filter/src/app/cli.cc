@@ -1,5 +1,7 @@
 # include "app/cli.hpp"
 
+# include <opencv2/core.hpp>
+
 # include <charconv>
 # include <ostream>
 # include <string_view>
@@ -44,6 +46,75 @@ bool parseUInt(std::string_view text, unsigned int& out)
         text.data(), text.data() + text.size(), out);
     return result.ec == std::errc {} &&
            result.ptr == text.data() + text.size();
+}
+
+// 作用：从 OpenCV 标定文件里读内参，填进配置。实现：FileStorage 读 K、D 和图像尺寸，缺项或形状不对就报错。
+bool loadIntrinsicsFile(
+    const std::string& path,
+    core::IntrinsicsConfig& intrinsics,
+    std::string& error)
+{
+    // 作用：打开标定 YAML，后续按节点名取数据。实现：FileStorage 只读模式，开不了直接报错。
+    cv::FileStorage fs(path, cv::FileStorage::READ);
+    if (!fs.isOpened())
+    {
+        error = "打不开标定文件: " + path;
+        return false;
+    }
+
+    // 作用：取出相机矩阵和畸变系数，这两个是硬性要求。实现：按节点名 >> 到 Mat。
+    cv::Mat camera_matrix;
+    cv::Mat distortion;
+    fs["camera_matrix"] >> camera_matrix;
+    fs["distortion_coefficients"] >> distortion;
+
+    // 作用：确认相机矩阵确实是 3x3，否则后面 at() 取值就危险了。实现：行列数检查。
+    if (camera_matrix.rows != 3 || camera_matrix.cols != 3)
+    {
+        error = "标定文件缺少 3x3 camera_matrix: " + path;
+        return false;
+    }
+    // 作用：畸变系数可以为 4/5/8 个，但不能一个都没有。实现：empty 检查。
+    if (distortion.empty())
+    {
+        error = "标定文件缺少 distortion_coefficients: " + path;
+        return false;
+    }
+
+    // 作用：统一成 double，别让 float 标定文件把精度截了。实现：convertTo CV_64F。
+    camera_matrix.convertTo(camera_matrix, CV_64F);
+    intrinsics.fx = camera_matrix.at<double>(0, 0);
+    intrinsics.fy = camera_matrix.at<double>(1, 1);
+    intrinsics.cx = camera_matrix.at<double>(0, 2);
+    intrinsics.cy = camera_matrix.at<double>(1, 2);
+
+    // 作用：把畸变系数拍成一维后逐项搬进配置。实现：先 reshape 成 1 行，再拷贝指针区间。
+    distortion = distortion.reshape(1, 1);
+    distortion.convertTo(distortion, CV_64F);
+    intrinsics.dist.assign(
+        distortion.ptr<double>(0),
+        distortion.ptr<double>(0) + distortion.total());
+
+    // 作用：图像尺寸用来后面校验帧分辨率，文件里没写就保留默认值。实现：读两个 int，都为正才覆盖。
+    int width = 0;
+    int height = 0;
+    fs["image_width"] >> width;
+    fs["image_height"] >> height;
+    if (width > 0 && height > 0)
+    {
+        intrinsics.width = width;
+        intrinsics.height = height;
+    }
+
+    // 作用：焦距是内参的命根子，非正数直接判文件不可用。实现：fx/fy 正数检查。
+    if (!(intrinsics.fx > 0.0) || !(intrinsics.fy > 0.0))
+    {
+        error = "标定文件焦距无效: " + path;
+        return false;
+    }
+
+    intrinsics.calibration_path = path;
+    return true;
 }
 
 // 作用：兼容老式“直接甩三个路径”的用法，别让老脚本一夜失效。实现：首个参数不是 -- 开头就按视频、IMU、输出目录的位置依次塞。
@@ -314,6 +385,36 @@ CliResult parseCommandLine(int argc, char** argv)
             result.config.camera.exposure_anchor = anchor;
             continue;
         }
+        // 作用：按场地一次性套用曝光、增益、帧率三件套。实现：解析名字后调 applyExposurePreset。
+        if (arg == "--exposure-preset")
+        {
+            const auto* value = requireValue();
+            if (!value) break;
+
+            core::ExposurePreset preset {};
+            if (*value == "dark")
+            {
+                preset = core::ExposurePreset::Dark;
+            }
+            else if (*value == "indoor")
+            {
+                preset = core::ExposurePreset::Indoor;
+            }
+            else if (*value == "bright")
+            {
+                preset = core::ExposurePreset::Bright;
+            }
+            else
+            {
+                result.error =
+                    "--exposure-preset 只支持 dark / indoor / bright: " +
+                    *value;
+                break;
+            }
+
+            core::applyExposurePreset(preset, result.config.camera);
+            continue;
+        }
         // 作用：关掉 Chunk-Exposure，相机不回报每帧曝光信息。实现：把 chunk_exposure 置假。
         if (arg == "--no-chunk-exposure")
         {
@@ -324,6 +425,32 @@ CliResult parseCommandLine(int argc, char** argv)
         if (arg == "--camera-timing-log")
         {
             result.config.camera.timing_log = true;
+            continue;
+        }
+        // 作用：没有云台反馈时也能跑，用固定姿态顶替。实现：imu_enabled 置假。
+        if (arg == "--no-imu")
+        {
+            result.config.imu_enabled = false;
+            continue;
+        }
+        // 作用：把原始观测量单独落盘，标定 R 用。实现：log_observations 置真。
+        if (arg == "--log-observations")
+        {
+            result.config.log_observations = true;
+            continue;
+        }
+        // 作用：加载外部标定文件，覆盖内置内参。实现：调 loadIntrinsicsFile，失败就把错误塞进 error 并停止解析。
+        if (arg == "--calibration")
+        {
+            const auto* value = requireValue();
+            if (!value) break;
+            if (!loadIntrinsicsFile(
+                    *value,
+                    result.config.intrinsics,
+                    result.error))
+            {
+                break;
+            }
             continue;
         }
         // 作用：设送进 EKF 的最大目标距离，太远的当噪声扔掉。实现：parseDouble 后写 target_max_distance。
@@ -372,6 +499,7 @@ void printUsage(std::ostream& out)
         "  kalman_filter --live [选项]\n"
         "  kalman_filter --list-cameras\n\n"
         "通用选项:\n"
+        "  --calibration PATH    相机标定文件（OpenCV YAML），不填用内置参考内参\n"
         "  --list-cameras        列出已连接的 MVS 相机\n"
         "  --help                显示帮助\n\n"
         "回放选项:\n"
@@ -385,12 +513,15 @@ void printUsage(std::ostream& out)
         "  --camera-height N     设置相机高度，0 表示不修改\n"
         "  --camera-fps F        设置相机帧率，0 表示不修改\n"
         "  --exposure-us US      设置曝光时间，0 表示不修改\n"
+        "  --exposure-preset P   dark / indoor / bright，一次配好曝光+增益+帧率\n"
         "  --gain G              设置增益，负数表示不修改\n"
         "  --camera-time-source S  host 或 device，默认 device\n"
         "  --camera-time-offset-us US  帧时间常数偏移，台架标定用\n"
         "  --camera-exposure-anchor R  设备戳在曝光区间的比例，0~1，默认 0.5\n"
         "  --no-chunk-exposure   关闭 Chunk-Exposure，不读每帧曝光\n"
         "  --camera-timing-log   打印时钟校准结果和每帧时间戳\n"
+        "  --no-imu              不用 C 板姿态，假定云台静止（串口可不接）\n"
+        "  --log-observations    把每块装甲板的原始观测量写入 observations.csv\n"
         "  --serial PATH         串口设备\n"
         "  --baud N              串口波特率\n"
         "  --comm-latency S      通信延迟估计，秒\n"
