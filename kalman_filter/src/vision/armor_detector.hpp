@@ -9,6 +9,8 @@
 # include <opencv2/core.hpp>
 # include <opencv2/dnn.hpp>
 
+# include "core/config.hpp"
+
 /*
 detector 类
 输入
@@ -30,25 +32,7 @@ armor旋转矩形 图象坐标系
 
 
 namespace detector {
-// 检测器配置
-struct DetectorConfig
-{
-    std::string model_path = "model/Infantry_fp32.onnx";
-
-    // 网络输入宽高
-    int input_width = 640;     
-    int input_height = 480;   
-
-    //阈值
-    float score_threshold = 0.5f;  
-    float nms_threshold = 0.45f;   
-
-    int ignore_color = -1;     // -1 表示不忽略；0/1/2/3 表示忽略对应颜色
-    bool ignore_purple = true; // 紫色通常是异常装甲板，默认忽略
-
-    int num_color = 4;         // 模型输出中的颜色分支数
-    int num_class = 9;         // 模型输出中的机器人类别数
-};
+using DetectorConfig = core::DetectorConfig;
 
 // 原图 -> 网络输入etterbox 变换的参数，做后处理时要把网络坐标还原到原图
 struct LetterboxInfo

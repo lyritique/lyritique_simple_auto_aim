@@ -8,18 +8,117 @@ set(CMAKE_CXX_STANDARD 23)
 
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(Threads REQUIRED)
+include(CTest)
+
+set(MVS_ROOT "/opt/MVS" CACHE PATH "Hikrobot MVS SDK root")
+find_path(
+    MVS_INCLUDE_DIR
+    NAMES MvCameraControl.h
+    PATHS "${MVS_ROOT}/include"
+    REQUIRED
+)
+find_library(
+    MVS_CAMERA_LIBRARY
+    NAMES MvCameraControl
+    PATHS "${MVS_ROOT}/lib/64"
+    REQUIRED
+)
 
 add_executable(
     kalman_filter
-    src/kalman_filter.cc
-    src/imu_alignment.cc
-    src/armor_detector.cc
-    src/main.cc
-    src/data_interaction.cc
-    src/draw.cc
-    src/serial_link.cc
+    src/app/cli.cc
+    src/app/main.cc
+    src/app/mode_runner.cc
+    src/debug/draw.cc
+    src/estimation/kalman_filter.cc
+    src/runtime/frame_processor.cc
+    src/runtime/realtime_pipeline.cc
+    src/runtime/replay_pipeline.cc
+    src/sensors/mvs_camera.cc
+    src/sensors/video_source.cc
+    src/timing/clock_sync.cc
+    src/timing/gimbal_history.cc
+    src/timing/replay_imu.cc
+    src/timing/latency_estimator.cc
+    src/transport/protocol.cc
+    src/transport/serial_link.cc
+    src/vision/armor_detector.cc
+    src/vision/pnp_solver.cc
 )
 
-target_include_directories(kalman_filter PRIVATE include/ ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(kalman_filter PRIVATE Eigen3::Eigen ${OpenCV_LIBS})
+target_include_directories(
+    kalman_filter
+    PRIVATE
+        src/
+        ${OpenCV_INCLUDE_DIRS}
+        ${MVS_INCLUDE_DIR}
+)
+target_link_libraries(
+    kalman_filter
+    PRIVATE
+        Eigen3::Eigen
+        ${OpenCV_LIBS}
+        ${MVS_CAMERA_LIBRARY}
+        Threads::Threads
+)
+set_target_properties(
+    kalman_filter
+    PROPERTIES
+        BUILD_RPATH "${MVS_ROOT}/lib/64"
+)
+
+if(BUILD_TESTING)
+    add_executable(
+        protocol_serial_test
+        tests/protocol_serial_test.cpp
+        src/transport/protocol.cc
+        src/transport/serial_link.cc
+    )
+    target_include_directories(protocol_serial_test PRIVATE src/)
+    target_link_libraries(
+        protocol_serial_test
+        PRIVATE
+            Threads::Threads
+            util
+    )
+    add_test(
+        NAME protocol_serial_test
+        COMMAND protocol_serial_test
+    )
+
+    add_executable(
+        clock_sync_test
+        tests/clock_sync_test.cpp
+        src/timing/clock_sync.cc
+    )
+    target_include_directories(clock_sync_test PRIVATE src/)
+    add_test(
+        NAME clock_sync_test
+        COMMAND clock_sync_test
+    )
+
+    add_executable(
+        gimbal_history_test
+        tests/gimbal_history_test.cpp
+        src/timing/gimbal_history.cc
+    )
+    target_include_directories(gimbal_history_test PRIVATE src/)
+    target_link_libraries(gimbal_history_test PRIVATE Eigen3::Eigen)
+    add_test(
+        NAME gimbal_history_test
+        COMMAND gimbal_history_test
+    )
+
+    add_executable(
+        latency_estimator_test
+        tests/latency_estimator_test.cpp
+        src/timing/latency_estimator.cc
+    )
+    target_include_directories(latency_estimator_test PRIVATE src/)
+    add_test(
+        NAME latency_estimator_test
+        COMMAND latency_estimator_test
+    )
+endif()
 

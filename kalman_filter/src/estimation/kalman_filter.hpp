@@ -1,5 +1,8 @@
-# ifndef AUTOAIM_KALMAN_
-# define AUTOAIM_KALMAN_
+# ifndef AUTOAIM_ESTIMATION_KALMAN_FILTER_HPP
+# define AUTOAIM_ESTIMATION_KALMAN_FILTER_HPP
+
+# include <limits>
+
 # include <eigen3/Eigen/Eigen>
 # include <vector>
 
@@ -109,5 +112,6 @@ class KalmanFilter
 };
 
 
-}//namespace kalfilter
+}   // namespace kalfilter
+
 # endif

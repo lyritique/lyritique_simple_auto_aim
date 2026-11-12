@@ -59,25 +59,6 @@ bool checkQtoV(const uint8_t* p);   // 累加和
 void packVtoQ(uint8_t* p);  // 封口（4.3）
 bool parse(const uint8_t* frame, GimbalToVision& out); // 验货（4.2）
 
-class SerialLink {
-public:
-    SerialLink() = default;
-    ~SerialLink();
-
-    SerialLink(const SerialLink&) = delete;
-    SerialLink& operator=(const SerialLink&) = delete;
-
-    bool open(const char* dev, int baud);
-    bool send(const VisionToGimbal&);          // 内部 pack + 循环 write
-    bool poll(GimbalToVision& out);            // 非阻塞取一帧
-    void close();
-
-private:
-    int fd_ = -1;
-    std::array<uint8_t, 128> rx_buffer_{};
-    std::size_t rx_size_ = 0;
-};
-
 }
 
 # endif

@@ -1,8 +1,11 @@
-# include "data_interaction.hpp"
-# include "type.hpp"
+# include "vision/pnp_solver.hpp"
+
+# include <algorithm>
+# include <cmath>
+# include <limits>
+
 # include <opencv2/calib3d.hpp>
 # include <opencv2/core.hpp>
-# include <iostream>
 
 
 
@@ -25,6 +28,21 @@ namespace{
 
 constexpr double kPi {3.14159265358979323846};
 
+struct candidate
+{
+    double rms {};
+    double cost {};
+    double tz {};
+    double yaw {};
+    Eigen::Matrix<double, 4, 1> measurement {};
+    Eigen::Vector3d normal {Eigen::Vector3d::Zero()};
+    cv::Mat rvec {};
+    cv::Mat tvec {};
+    int branch {};
+    bool inward {};
+    bool reverse {};
+};
+
 double wrapPi(double a)//我怎么觉得好像写过
 {
     while (a > kPi) a -= 2.0 * kPi;
@@ -34,7 +52,7 @@ double wrapPi(double a)//我怎么觉得好像写过
 
 
 
-}
+}   // namespace
 
 std::array<cv::Point2f, 4> pnpSolver::canonicalize(
     const std::array<cv::Point2d, 4>& raw, bool reverse) const
@@ -77,7 +95,7 @@ std::array<cv::Point2f, 4> pnpSolver::canonicalize(
     std::array<cv::Point2f, 4> out {};
     for (int i = 0; i < 4; ++i) out[i] = ring[(longest + i) % 4];
     return out;
-}
+}   // namespace pnp
 
 
 
@@ -290,4 +308,4 @@ PnPResult pnpSolver::getOutput()
     result.normal = last_normal_;
     return result;
 }
-}
+}   // namespace pnp

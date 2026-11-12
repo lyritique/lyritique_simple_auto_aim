@@ -1,5 +1,5 @@
-# ifndef AUTOAIM_DATA_INTERACTION_
-# define AUTOAIM_DATA_INTERACTION_
+# ifndef AUTOAIM_VISION_PNP_SOLVER_HPP
+# define AUTOAIM_VISION_PNP_SOLVER_HPP
 
 # include <array>
 # include <vector>
@@ -155,5 +155,6 @@ class pnpSolver
 
 };
 
-}//namespace pnp
+}   // namespace pnp
+
 # endif
