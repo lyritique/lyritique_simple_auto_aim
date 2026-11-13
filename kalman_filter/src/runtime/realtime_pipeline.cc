@@ -4,6 +4,7 @@
 
 # include <algorithm>
 # include <chrono>
+# include <iomanip>
 # include <utility>
 # include <filesystem>
 # include <fstream>
@@ -68,21 +69,25 @@ bool RealtimePipeline::start(std::string* error)
         stats_ = PipelineStats {};
     }
 
-    // 作用：串口路径都没配就别往下走了。实现：empty 检查后调 fail 返回。
-    if (config_.serial.device.empty())
+    // 作用：无 IMU 模式下串口整块跳过，姿态由固定值顶替。实现：整个打开流程包在 imu_enabled 判断里。
+    if (config_.imu_enabled)
     {
-        return fail("串口设备路径为空", error);
-    }
+        // 作用：串口路径都没配就别往下走了。实现：empty 检查后调 fail 返回。
+        if (config_.serial.device.empty())
+        {
+            return fail("串口设备路径为空", error);
+        }
 
-    // 作用：打开串口，反馈线程就靠它吃饭。实现：SerialLink::open 带设备路径和波特率，失败就报错。
-    if (!serial_.open(
-            config_.serial.device.c_str(),
-            config_.serial.baud))
-    {
-        return fail(
-            "串口打开失败: " + config_.serial.device +
-                " @" + std::to_string(config_.serial.baud),
-            error);
+        // 作用：打开串口，反馈线程就靠它吃饭。实现：SerialLink::open 带设备路径和波特率，失败就报错。
+        if (!serial_.open(
+                config_.serial.device.c_str(),
+                config_.serial.baud))
+        {
+            return fail(
+                "串口打开失败: " + config_.serial.device +
+                    " @" + std::to_string(config_.serial.baud),
+                error);
+        }
     }
 
     // 作用：按配置造出具体相机（实时是 MVS）。实现：make_unique 后调 open，失败就把刚开的串口也关掉。
@@ -96,11 +101,15 @@ bool RealtimePipeline::start(std::string* error)
 
     // 作用：设备都就绪了，才正式宣布运行，再起收包线程。实现：running_ 置真，jthread 里跑 feedbackLoop。
     running_.store(true);
-    feedback_thread_ = std::jthread(
-        [this](std::stop_token token)
-        {
-            feedbackLoop(token);
-        });
+    // 作用：无 IMU 模式没有反馈可收，就别起线程。实现：imu_enabled 为真才构造 jthread。
+    if (config_.imu_enabled)
+    {
+        feedback_thread_ = std::jthread(
+            [this](std::stop_token token)
+            {
+                feedbackLoop(token);
+            });
+    }
     return true;
 }
 
@@ -112,7 +121,8 @@ void RealtimePipeline::run(
     // 作用：没 start 就别空转。实现：running_ 为假直接返回。
     if (!running_.load()) return;
 
-    std::ofstream csv; 
+    std::ofstream csv;
+    std::ofstream observation_csv;
     std::error_code ec;
     std::filesystem::create_directories(config_.output_directory, ec);
 
@@ -121,7 +131,21 @@ void RealtimePipeline::run(
         csv.open(config_.output_directory + "/realtime.csv");
         if (csv)
         {
+            // 时间戳是 steady_clock 的秒数，量级 1e5，默认 6 位有效数字只剩 1 秒精度。
+            csv << std::fixed << std::setprecision(6);
             csv << "time,valid,px,py,pz,yaw,vx,vy,vz,vyaw,r," << "latency_ms,detections,feedback\r\n";
+        }
+
+        if (config_.log_observations)
+        {
+            observation_csv.open(
+                config_.output_directory + "/observations.csv");
+            if (observation_csv)
+            {
+                observation_csv << std::fixed << std::setprecision(9);
+                observation_csv
+                    << "time,azi,ele,dist,yaw,reproj_err,sent_to_ekf\r\n";
+            }
         }
     }
 
@@ -160,12 +184,28 @@ void RealtimePipeline::run(
             }
             csv << result.process_latency << ','
                 << result.valid_detections << ','
-                << (result.feedback_available ? 1 : 0) << '\r\n';
+                << (result.feedback_available ? 1 : 0) << "\r\n";
+        }
+
+        if (observation_csv)
+        {
+            for (const auto& record : result.observations)
+            {
+                observation_csv
+                    << result.frame_time << ','
+                    << record.azi << ','
+                    << record.ele << ','
+                    << record.dist << ','
+                    << record.yaw << ','
+                    << record.reproj_err << ','
+                    << (record.sent_to_ekf ? 1 : 0) << "\r\n";
+            }
         }
     }
 
     // 作用：循环退出说明该收摊了。实现：调 stop() 统一关线程和设备。
     if (csv) csv.close();
+    if (observation_csv) observation_csv.close();
     stop();
 }
 
@@ -244,8 +284,15 @@ PipelineFrameResult RealtimePipeline::processFrame(
 
     // 作用：去历史里找这一帧时刻的云台姿态。实现：调 waitForAttitude，带超时等待。
     kalfilter::GimbalSample attitude;
+    // 作用：无 IMU 时用单位四元数顶替，世界系就等于初始相机系。实现：imu_enabled 为假才走这一支。
+    if (!config_.imu_enabled)
+    {
+        attitude.host_time = frame.timestamp;
+        attitude.board_time_us = 0;
+        attitude.q.setIdentity();
+    }
     // 作用：等不到就丢帧，别拿旧姿态凑合。实现：返回假就计数 dropped_frames 并原样返回空结果。
-    if (!waitForAttitude(frame.timestamp, attitude))
+    else if (!waitForAttitude(frame.timestamp, attitude))
     {
         {
             std::lock_guard<std::mutex> lock(stats_mutex_);
@@ -253,9 +300,11 @@ PipelineFrameResult RealtimePipeline::processFrame(
         }
         return result;
     }
-
-    // 作用：姿态到手，标记本帧反馈可用。实现：置 true。
-    result.feedback_available = true;
+    else
+    {
+        // 作用：姿态到手，标记本帧反馈可用。实现：置 true。
+        result.feedback_available = true;
+    }
 
     // 作用：第一次成功拿到姿态就把它当世界系基准。实现：没初始化过就存 q_init_ 并置标志。
     if (!has_q_init_)
@@ -277,6 +326,19 @@ PipelineFrameResult RealtimePipeline::processFrame(
     // 作用：把有效检测数、滤波状态、可信标志搬进对外结果。实现：逐字段赋值，检测数取 observations 大小。
     result.valid_detections = static_cast<int>(
         processing.observations.size());
+
+    // 作用：把原始观测原样留一份给外部落盘，标定 R 靠它。实现：逐条拷成轻量记录。
+    for (const auto& observation : processing.observations)
+    {
+        ObservationRecord record;
+        record.azi = observation.ypd.azi;
+        record.ele = observation.ypd.ele;
+        record.dist = observation.ypd.dist;
+        record.yaw = observation.ekf_yaw;
+        record.reproj_err = observation.pose.err;
+        record.sent_to_ekf = observation.sent_to_ekf;
+        result.observations.push_back(record);
+    }
     result.state = processing.state;
     result.state_valid = processing.state_valid;
 

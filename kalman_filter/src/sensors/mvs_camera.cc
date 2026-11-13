@@ -39,6 +39,10 @@ std::string hexCode(int code)
     return out.str();
 }
 
+// 节点读不到设备戳时，拿多少帧来估时钟。100 帧 ≈ 5 秒（20 fps），
+// 窗口太短的话斜率误差会变成每秒几毫秒的漂移。
+constexpr int kFrameCalibFrames = 100;
+
 // 设备信息里的 char[] 不保证带 '\0'，按长度找零再截断。
 std::string fixedString(const unsigned char* data, std::size_t size)
 {
@@ -404,12 +408,19 @@ bool MvsCamera::open(std::string* error)
             std::clog << "警告: 设备时钟校准失败（" << clock_error
                       << "），退回收帧时刻\n";
         }
+        else if (!clock_ready_)
+        {
+            std::clog << "提示: DeviceTimestamp 节点不可用，改用前 "
+                      << calib_frames_left_ << " 帧在线校准\n";
+        }
     }
 
     if (config_.timing_log)
     {
         std::clog << "[相机时钟] mode="
-                  << (clock_ready_ ? "device" : "host")
+                  << (clock_ready_ ? "device"
+                                   : (calib_frames_left_ > 0 ? "calibrating"
+                                                             : "host"))
                   << " ns/tick=" << clock_scale_ * 1e9
                   << " offset=" << clock_offset_
                   << " spread=" << clock_spread_ms_ << " ms\n";
@@ -567,6 +578,90 @@ core::FrameReadStatus MvsCamera::read(
             ? info.fExposureTime
             : config_.exposure_time_us;
 
+    // 节点校准不了（戳恒为 0 或只在出帧时跳）就用真实帧补：
+    // 斜率（每秒多少 tick）必须从时间跨度里拟合出来 —— 相机报的 Increment 只是标称值，
+    // 实际可能差百分之一，按标称值算会以每秒几毫秒的速度累积漂移。
+    if (!clock_ready_ && calib_frames_left_ > 0 &&
+        config_.use_device_timestamp && device_ticks != 0)
+    {
+        calib_ticks_.push_back(device_ticks);
+        calib_hosts_.push_back(host_time);
+        --calib_frames_left_;
+
+        if (calib_frames_left_ == 0)
+        {
+            const std::size_t n = calib_ticks_.size();
+            double mean_t = 0.0;
+            double mean_h = 0.0;
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                mean_t += static_cast<double>(calib_ticks_[i]);
+                mean_h += calib_hosts_[i];
+            }
+            mean_t /= static_cast<double>(n);
+            mean_h /= static_cast<double>(n);
+
+            double cov = 0.0;
+            double var = 0.0;
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double dt =
+                    static_cast<double>(calib_ticks_[i]) - mean_t;
+                cov += dt * (calib_hosts_[i] - mean_h);
+                var += dt * dt;
+            }
+
+            // 斜率 = 每 tick 多少秒。拟合不出来（窗口内没跨度）就保留标称值。
+            const double fitted = var > 0.0 ? cov / var : 0.0;
+            if (fitted >= 5e-9 && fitted <= 2e-8)
+            {
+                clock_scale_ = fitted;
+            }
+
+            // 截距取残差的最小值：传输延迟只会让「收帧时刻 - 设备时刻」变大，
+            // 最小值最接近真实的时钟偏差。
+            double best = 0.0;
+            bool has_best = false;
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double d =
+                    calib_hosts_[i] -
+                    static_cast<double>(calib_ticks_[i]) * clock_scale_;
+                if (!has_best || d < best)
+                {
+                    best = d;
+                    has_best = true;
+                }
+            }
+
+            clock_offset_ = best;
+            clock_spread_ms_ = 0.0;
+            clock_ready_ = true;
+            std::clog << "[相机时钟] 帧校准完成 ns/tick="
+                      << clock_scale_ * 1e9 << " 样本=" << n << '\n';
+            // 校准期间 last_frame_timestamp_ 记的是收帧时刻，换到设备时刻会"倒退"，
+            // 不清掉就会被单调性护栏一直钳成 host_time。
+            last_frame_timestamp_ = 0.0;
+            calib_ticks_.clear();
+            calib_hosts_.clear();
+        }
+    }
+
+    // 滞后一路涨说明两件事之一：相机晶振和主机不一致（比例算错了），
+    // 或者取帧跟不上、SDK 内部积压（那是真延迟）。两者都会让预测偏，
+    // 但修法完全不同，所以先报警让人别当成正常现象。
+    if (clock_ready_ && device_ticks != 0 && last_host_time_ > 0.0)
+    {
+        const double lag = host_time - (deviceTicksToHost(device_ticks));
+        if (lag > 0.1 && lag - last_warned_lag_ > 0.05)
+        {
+            last_warned_lag_ = lag;
+            std::clog << "警告: 帧时间戳滞后 " << lag * 1000.0
+                      << " ms 且持续增大，检查相机取帧是否积压\n";
+        }
+    }
+    if (clock_ready_) last_host_time_ = host_time;
+
     double stamp = host_time;
     if (config_.use_device_timestamp && clock_ready_ && device_ticks != 0)
     {
@@ -664,6 +759,9 @@ void MvsCamera::close()
     clock_ready_ = false;
     clock_offset_ = 0.0;
     clock_spread_ms_ = 0.0;
+    calib_frames_left_ = 0;
+    calib_ticks_.clear();
+    calib_hosts_.clear();
     last_frame_timestamp_ = 0.0;
 }
 
@@ -690,26 +788,42 @@ bool MvsCamera::calibrateDeviceClock(std::string* error)
     clock_ready_ = false;
     clock_offset_ = 0.0;
     clock_spread_ms_ = 0.0;
+    calib_frames_left_ = 0;
+    calib_ticks_.clear();
+    calib_hosts_.clear();
 
     // 多数型号的 DeviceTimestamp 直接是 ns；万一按 tick 计，用 Increment 换算。
+    // 但各型号对这个节点的解释不一致：小于 1e6 的当成「每 tick 多少纳秒」，
+    // 更大的当成「每秒多少 tick」（即频率 Hz）。搞反了时间戳会成倍漂移。
     clock_scale_ = 1e-9;
     MVCC_INTVALUE_EX increment {};
     if (MV_CC_GetIntValueEx(
             handle_, "DeviceTimestampIncrement", &increment) == MV_OK &&
         increment.nCurValue > 0)
     {
-        clock_scale_ = static_cast<double>(increment.nCurValue) * 1e-9;
+        const double raw = static_cast<double>(increment.nCurValue);
+        clock_scale_ = raw >= 1e6 ? 1.0 / raw : raw * 1e-9;
     }
 
     // 只在读节点的瞬间配对，不掺入图像传输延迟，否则等于没换。
+    // 有些型号的 DeviceTimestamp 是按帧更新的，采样窗口必须跨过几个帧周期，
+    // 否则连续读到同一个值会被误判成"没走动"。
     constexpr int kSamples = 24;
+    constexpr double kMaxWaitSeconds = 1.0;
     std::vector<double> offsets;
     offsets.reserve(kSamples);
     uint64_t first_ticks = 0;
     uint64_t last_ticks = 0;
+    int taken = 0;
+    int changes = 0;
 
-    for (int i = 0; i < kSamples; ++i)
+    const double deadline = steadyNowSeconds() + kMaxWaitSeconds;
+    for (;;)
     {
+        // 够样本且值已经走动就收工；等满一秒还没动就认输。
+        if (taken >= kSamples && last_ticks > first_ticks) break;
+        if (steadyNowSeconds() > deadline) break;
+
         const double before = steadyNowSeconds();
         uint64_t ticks = 0;
         std::string read_error;
@@ -720,26 +834,48 @@ bool MvsCamera::calibrateDeviceClock(std::string* error)
         }
         const double after = steadyNowSeconds();
 
-        if (i == 0) first_ticks = ticks;
+        if (taken == 0) first_ticks = ticks;
+        else if (ticks != last_ticks) ++changes;
         last_ticks = ticks;
+        ++taken;
 
         offsets.push_back(
             (before + after) * 0.5 -
             static_cast<double>(ticks) * clock_scale_);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    if (offsets.empty())
+    {
+        if (error) *error = "DeviceTimestamp 采样为空";
+        return false;
     }
 
     if (last_ticks <= first_ticks)
     {
-        if (error) *error = "DeviceTimestamp 没有走动";
-        return false;
+        // 节点恒为 0，或者只在出帧时跳一次，都走这里。
+        // 这种型号的戳在帧信息里是好的，改用真实帧做在线校准。
+        calib_frames_left_ = kFrameCalibFrames;
+        return true;
     }
 
     std::sort(offsets.begin(), offsets.end());
-    const std::size_t mid = offsets.size() / 2;
-    clock_offset_ = offsets.size() % 2 == 0
-        ? (offsets[mid - 1] + offsets[mid]) * 0.5
-        : offsets[mid];
+
+    // 自由计数器每次读都在变，抖动只是噪声，取中位数最稳；
+    // 按帧更新的节点（值只在帧到达时跳一次）会让 offset 呈锯齿，
+    // 取最小值才对应"戳刚更新"那一刻，不会带上半个帧周期的偏差。
+    const bool free_running = changes * 2 >= taken;
+    if (free_running)
+    {
+        const std::size_t mid = offsets.size() / 2;
+        clock_offset_ = offsets.size() % 2 == 0
+            ? (offsets[mid - 1] + offsets[mid]) * 0.5
+            : offsets[mid];
+    }
+    else
+    {
+        clock_offset_ = offsets.front();
+    }
     clock_spread_ms_ = (offsets.back() - offsets.front()) * 1000.0;
     clock_ready_ = true;
     return true;

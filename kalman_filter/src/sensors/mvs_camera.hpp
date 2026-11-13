@@ -85,6 +85,13 @@ private:
     double clock_scale_ {1e-9};    // 设备 tick -> 秒
     double clock_offset_ {};       // host = device 秒 + offset
     double clock_spread_ms_ {};    // 校准样本极差，诊断用
+    // 节点读不到设备戳时，改用前若干帧的「收帧时刻 - 设备戳」做在线校准。
+    int calib_frames_left_ {};
+    std::vector<std::uint64_t> calib_ticks_;
+    std::vector<double> calib_hosts_;
+    // 校准完成后每帧对比映射时刻和收帧时刻，专门盯滞后是否持续增大。
+    double last_host_time_ {};
+    double last_warned_lag_ {};
     double last_frame_timestamp_ {};
 };
 

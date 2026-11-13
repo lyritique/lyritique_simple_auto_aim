@@ -2,6 +2,7 @@
 # define AUTOAIM_CORE_CONFIG_HPP
 
 # include <string>
+# include <vector>
 
 namespace core
 {
@@ -10,6 +11,32 @@ enum class RunMode
 {
     Replay,
     Live
+};
+
+/*
+ * 相机内参。默认值来自第三周作业提供的参考标定，1440×1080。
+ * 用 --calibration 指定标定文件后，这里的数值会被文件内容覆盖。
+ */
+struct IntrinsicsConfig
+{
+    // 标定文件路径；空表示不加载，直接用下面的默认值。
+    std::string calibration_path {};
+
+    // 与标定文件 image_width / image_height 对应，用来校验画面尺寸。
+    int width {1440};
+    int height {1080};
+
+    double fx {2362.2795952460974};
+    double fy {2336.1916035376717};
+    double cx {679.17513921636282};
+    double cy {529.06858905837635};
+    // k1, k2, p1, p2, k3；用 vector 是为了兼容 4/5/8 系数。
+    std::vector<double> dist {
+        -0.098561592108101559,
+        0.11173066531932681,
+        -0.0038352945867108721,
+        -0.0020421443354436304,
+        0.0};
 };
 
 struct CameraConfig
@@ -35,6 +62,40 @@ struct CameraConfig
     // 打印时钟校准结果和每帧时间戳，台架实验用。
     bool timing_log {false};
 };
+
+// 场地曝光预设：曝光时间、增益、帧率三者必须一起配，改一个不改另一个会互相打架。
+enum class ExposurePreset
+{
+    Dark,     // 暗实验室
+    Indoor,   // 室内正常照明
+    Bright    // 强光 / 补光灯直射
+};
+
+// 作用：把预设展开成相机参数。实现：三组固定值直接写回 CameraConfig，返回假表示取值不合法。
+inline bool applyExposurePreset(
+    ExposurePreset preset,
+    CameraConfig& camera)
+{
+    switch (preset)
+    {
+        case ExposurePreset::Dark:
+            camera.exposure_time_us = 50000.0F;   // 50 ms → 20 fps 上限
+            camera.gain = 0.0F;
+            camera.frame_rate = 20.0F;
+            return true;
+        case ExposurePreset::Indoor:
+            camera.exposure_time_us = 25000.0F;   // 25 ms → 40 fps 上限
+            camera.gain = 0.0F;
+            camera.frame_rate = 40.0F;
+            return true;
+        case ExposurePreset::Bright:
+            camera.exposure_time_us = 8000.0F;    // 8 ms → 60 fps
+            camera.gain = 0.0F;
+            camera.frame_rate = 60.0F;
+            return true;
+    }
+    return false;
+}
 
 struct DetectorConfig
 {
@@ -77,9 +138,16 @@ struct AppConfig
     std::string output_directory {"output"};
 
     CameraConfig camera;
+    IntrinsicsConfig intrinsics;
     DetectorConfig detector;
     SerialConfig serial;
     TimingConfig timing;
+
+    // 无 IMU 模式：不打开串口、不等待云台姿态，世界系固定在初始相机系（假定云台静止）。
+    bool imu_enabled {true};
+
+    // 把每块装甲板的原始观测量（YPD）单独落盘，标定 R 用。
+    bool log_observations {false};
 
     double target_max_distance {2.5};
 };

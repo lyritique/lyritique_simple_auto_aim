@@ -102,16 +102,19 @@ std::array<cv::Point2f, 4> pnpSolver::canonicalize(
 
 
 
-pnpSolver::pnpSolver()
+// 作用：用配置里的内参构造相机矩阵和畸变系数。实现：K 按 fx/fy/cx/cy 填成 3x3，D 从 vector 原样搬成 1xN。
+pnpSolver::pnpSolver(const core::IntrinsicsConfig& intrinsics)
 {
-    const pnpConfig::camParams cam;
-
+    // 作用：拼出 3x3 内参矩阵，畸变模型只认这个对角线结构。实现：cv::Mat_ 逐项写入，末行固定 0 0 1。
     camera_matrix_ = (cv::Mat_<double>(3, 3) <<
-        cam.fx, 0.0,    cam.cx,
-        0.0,    cam.fy, cam.cy,
-        0.0,    0.0,    1.0);
+        intrinsics.fx, 0.0,           intrinsics.cx,
+        0.0,           intrinsics.fy, intrinsics.cy,
+        0.0,           0.0,           1.0);
 
-    std::vector<double> d(cam.dist.data(), cam.dist.data() + cam.dist.size());
+    // 作用：把任意长度的畸变数组搬进 OpenCV 的 1xN 矩阵，4/5/8 系数都能过。实现：vector 区间构造后 clone 一份独立存储。
+    std::vector<double> d(
+        intrinsics.dist.begin(),
+        intrinsics.dist.end());
     distortion_coeffs_ = cv::Mat(d, true).clone();
 }
 

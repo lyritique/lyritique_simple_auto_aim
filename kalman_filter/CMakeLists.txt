@@ -120,5 +120,29 @@ if(BUILD_TESTING)
         NAME latency_estimator_test
         COMMAND latency_estimator_test
     )
+
+    add_executable(
+        kalman_lost_timeout_test
+        tests/kalman_lost_timeout_test.cpp
+        src/estimation/kalman_filter.cc
+    )
+    target_include_directories(kalman_lost_timeout_test PRIVATE src/)
+    target_link_libraries(kalman_lost_timeout_test PRIVATE Eigen3::Eigen)
+    add_test(
+        NAME kalman_lost_timeout_test
+        COMMAND kalman_lost_timeout_test
+    )
+
+    add_executable(
+        kalman_yaw_wrap_test
+        tests/kalman_yaw_wrap_test.cpp
+        src/estimation/kalman_filter.cc
+    )
+    target_include_directories(kalman_yaw_wrap_test PRIVATE src/)
+    target_link_libraries(kalman_yaw_wrap_test PRIVATE Eigen3::Eigen)
+    add_test(
+        NAME kalman_yaw_wrap_test
+        COMMAND kalman_yaw_wrap_test
+    )
 endif()
 

@@ -51,6 +51,12 @@ int runLive(const core::AppConfig& config)
 {
     // 作用：建实时管线，配置原样传入。实现：栈上 RealtimePipeline 对象。
     realtime::RealtimePipeline pipeline(config);
+    // 作用：没有云台反馈时把前提说清楚，免得把结果当成真实标定结果。实现：imu_enabled 为假就提示一句。
+    if (!config.imu_enabled)
+    {
+        std::cerr
+            << "警告: 无 IMU 模式，假定云台静止；世界系固定在初始相机姿态。\n";
+    }
     // 作用：准备错误槽并尝试启动设备。实现：start 失败就打印原因并返回 1。
     std::string error;
     if (!pipeline.start(&error))

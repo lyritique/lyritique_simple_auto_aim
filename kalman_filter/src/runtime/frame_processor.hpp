@@ -31,6 +31,10 @@ struct FrameObservation
     pnp::PnPResult pose;
     // 作用：记录这块板子有没有真的进 EKF。实现：bool 标记，供下游统计和调试。
     bool sent_to_ekf {};
+    // 作用：折成的 YPD 观测，标定观测噪声 R 用。实现：computeYPD 的结果原样带上。
+    kalfilter::cam_ypd ypd {};
+    // 作用：实际喂给 EKF 的装甲板朝向角。实现：由板法向 atan2 得到。
+    double ekf_yaw {};
 };
 
 struct FrameProcessingResult
@@ -86,18 +90,22 @@ public:
 private:
     // 作用：检测器参数的本地副本，检测器生命周期都靠它。实现：构造时从 AppConfig 拷一份。
     core::DetectorConfig detector_config_;
+    // 作用：内参的本地副本，用来校验每一帧的尺寸和它是否匹配。实现：构造时从 AppConfig 拷一份。
+    core::IntrinsicsConfig intrinsics_;
     // 作用：超过这个距离的板子不进 EKF，防止拿远处的噪声当目标。实现：double 阈值，process 里和 ypd.dist 比。
     double target_max_distance_ {};
 
     // 作用：真正干检测的工人。实现：构造时用 detector_config_ 初始化。
     detector::Detector detector_;
-    // 作用：PnP 解算器，负责把像素角点变成 3D 位姿。实现：默认构造，内部自带相机参数。
+    // 作用：PnP 解算器，负责把像素角点变成 3D 位姿。实现：构造时用 intrinsics_ 初始化，不再吃类内硬编码。
     pnp::pnpSolver pnp_;
     // 作用：卡尔曼滤波器，整条链路的大脑。实现：默认构造，第一次观测时 init。
     kalfilter::KalmanFilter ekf_;
 
     // 作用：记住 EKF 是否已经初始化，没初始化就只能 init 不能 update。实现：bool 开关，init 成功后置 true。
     bool ekf_initialized_ {};
+    // 作用：画面尺寸和内参对不上的告警只打一次，避免每帧刷屏。实现：bool 开关。
+    bool size_warned_ {};
     // 作用：记住有没有上一帧时间，第一帧没有 dt 可算。实现：bool 门禁，首帧后置 true。
     bool has_last_frame_time_ {};
     // 作用：上一帧的时间戳，用来算预测步的 dt。实现：double 秒，每帧覆盖。

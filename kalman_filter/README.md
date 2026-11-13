@@ -81,6 +81,7 @@ cmake -S . -B build -DMVS_ROOT=/path/to/MVS
 |---|---|
 | `--imu-offset-ms MS` | IMU 相对图像的时间偏移，离线默认 `9 ms` |
 | `--max-distance M` | 送入 EKF 的最大目标距离，默认 `2.5 m` |
+| `--calibration PATH` | 相机标定文件（OpenCV YAML），覆盖内置参考内参 |
 | `--help` | 查看完整帮助 |
 
 输出：
@@ -117,6 +118,7 @@ CSV 的历史格式保留下来，因此数据行末尾可能追加数量不固�
 | `--camera-timing-log` | 打印时钟校准结果和每帧时间戳 |
 | `--comm-latency S` | 串口到云台执行延迟估计 |
 | `--max-distance M` | 送入 EKF 的最大目标距离 |
+| `--calibration PATH` | 相机标定文件（OpenCV YAML），覆盖内置参考内参 |
 
 时间戳来源：
 
@@ -172,7 +174,7 @@ yaw = atan2(n_C0.x, n_C0.z)
 ## 当前限制
 
 - MVS 封装默认把相机 `DeviceTimestamp` 映射到主机单调钟作为帧时间；校准失败时退回收帧时刻。设备戳对应曝光开始/中点/结束的哪一种，仍需台架实测后通过 `--camera-exposure-anchor` 指定。
-- 实时相机的分辨率、曝光、增益和焦距必须与内参标定时一致。
+- 实时相机的分辨率、曝光、增益和焦距必须与内参标定时一致。内参默认是材料里的参考值，可用 `--calibration` 指向 `camera_calibration` 输出的 YAML；画面尺寸与标定不一致时会在首帧打印一次警告。
 - C 板反馈中的 `DWT_stamp` 当前按 32 位微秒、可回绕处理。
 - 相机杆臂和真实安装外参尚未建模；当前假设 C 板给出的 `q` 已经完成相机姿态换算。
 - `total_delay = process_latency + comm_latency + fly_time` 的统计框架已具备，但通信延迟和飞行时间仍需现场测量或由弹道模块提供。

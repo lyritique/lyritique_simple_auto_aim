@@ -8,6 +8,7 @@
 # include <mutex>
 # include <string>
 # include <thread>
+# include <vector>
 
 # include "core/config.hpp"
 # include "core/frame.hpp"
@@ -33,6 +34,17 @@ namespace realtime
 
 using RealtimePipelineConfig = core::AppConfig;
 
+// 作用：一条原始观测记录，只用于标定观测噪声，不参与滤波。实现：YPD 加朝向角。
+struct ObservationRecord
+{
+    double azi {};
+    double ele {};
+    double dist {};
+    double yaw {};
+    double reproj_err {};
+    bool sent_to_ekf {};
+};
+
 struct PipelineFrameResult
 {
     // 作用：这一帧的时间戳，下游对齐和日志都靠它。实现：从 frame.timestamp 拷进来。
@@ -49,6 +61,9 @@ struct PipelineFrameResult
 
     // 作用：EKF 的最终状态整包。实现：直接拷贝 processing.state。
     kalfilter::KFResult state;
+
+    // 作用：本帧所有原始观测，标定 R 时用。实现：从 FrameObservation 逐条拷成轻量记录。
+    std::vector<ObservationRecord> observations;
 };
 
 struct PipelineStats

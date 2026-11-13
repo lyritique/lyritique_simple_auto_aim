@@ -82,16 +82,19 @@ std::array<cv::Point2f, 4> refineArmorCorners(
 // 作用：按配置把处理器组装起来，顺便存下距离阈值。实现：初始化列表构造检测器，其余成员就地默认构造。
 FrameProcessor::FrameProcessor(const core::AppConfig& config)
     : detector_config_(config.detector),
+      intrinsics_(config.intrinsics),
       target_max_distance_(config.target_max_distance),
-      detector_(detector_config_)
+      detector_(detector_config_),
+      pnp_(intrinsics_)
 {
 }
 
-// 作用：重置滤波器和帧时间记忆，开始新一段视频。实现：ekf_.reset() 加三个标志位归零。
+// 作用：重置滤波器和帧时间记忆，开始新一段视频。实现：ekf_.reset() 加标志位归零。
 void FrameProcessor::reset()
 {
     ekf_.reset();
     ekf_initialized_ = false;
+    size_warned_ = false;
     has_last_frame_time_ = false;
     last_frame_time_ = 0.0;
 }
@@ -103,6 +106,18 @@ FrameProcessingResult FrameProcessor::process(
 {
     // 作用：先把这一帧的结果容器准备好，各字段默认零值。实现：栈上默认构造。
     FrameProcessingResult result;
+
+    // 作用：画面尺寸和内参必须配套，不匹配就提醒一次，后面 PnP 的尺度都会歪。实现：比较行列数，只警告不拦帧。
+    if (!size_warned_ &&
+        (frame.bgr.cols != intrinsics_.width ||
+         frame.bgr.rows != intrinsics_.height))
+    {
+        size_warned_ = true;
+        std::cerr << "帧尺寸 " << frame.bgr.cols << "x" << frame.bgr.rows
+                  << " 与内参 " << intrinsics_.width << "x"
+                  << intrinsics_.height
+                  << " 不一致，PnP 结果可能不准\n";
+    }
 
     // 作用：只有上过战场才知道该走多远，首帧不预测。实现：已初始化且有上帧时间才继续。
     if (ekf_initialized_ && has_last_frame_time_)
@@ -178,6 +193,7 @@ FrameProcessingResult FrameProcessor::process(
         // 作用：把位姿折成 YPD 观测，同时拿距离做门限判断。实现：先声明局部变量再调 computeYPD。
         kalfilter::cam_ypd ypd;
         computeYPD(pose.measurement, ypd);
+        observation.ypd = ypd;
         // 作用：太远的板子只记账不滤波，免得噪声把状态带歪。实现：距离超阈值就 push 后 continue。
         if (ypd.dist > target_max_distance_)
         {
@@ -202,6 +218,7 @@ FrameProcessingResult FrameProcessor::process(
             p_w.y(),
             p_w.z(),
             std::atan2(n_w.x(), n_w.z());
+        observation.ekf_yaw = ekf_input.measurement(3);
 
         // 作用：先把“已送 EKF”的章盖好，再入账。实现：标记置 true，然后 push 观测。
         observation.sent_to_ekf = true;
