@@ -439,6 +439,47 @@ CliResult parseCommandLine(int argc, char** argv)
             result.config.log_observations = true;
             continue;
         }
+        // 作用：打印各阶段耗时，判断该砍推理还是砍后处理。实现：profile 置真。
+        if (arg == "--profile")
+        {
+            result.config.profile = true;
+            continue;
+        }
+        // 作用：选推理后端，现场缺 TensorRT 时可切 CUDA 或 CPU。实现：只认四个值，其余报错。
+        if (arg == "--detector-backend")
+        {
+            const auto* value = requireValue();
+            if (!value) break;
+            if (*value != "auto" && *value != "trt" &&
+                *value != "cuda" && *value != "cpu")
+            {
+                result.error =
+                    "无效的检测后端: " + *value + "（可选 auto/trt/cuda/cpu）";
+                break;
+            }
+            result.config.detector.backend = *value;
+            continue;
+        }
+        // 作用：关掉 TensorRT FP16，做精度对照用。实现：fp16 置假。
+        if (arg == "--no-fp16")
+        {
+            result.config.detector.fp16 = false;
+            continue;
+        }
+        // 作用：指定 TensorRT engine 缓存目录，空字符串表示禁用。实现：取值后写 engine_cache_dir。
+        if (arg == "--trt-cache")
+        {
+            const auto* value = requireValue();
+            if (!value) break;
+            result.config.detector.engine_cache_dir = *value;
+            continue;
+        }
+        // 作用：打开 ORT / TensorRT 初始化日志。实现：detector_verbose 置真。
+        if (arg == "--detector-verbose")
+        {
+            result.config.detector.detector_verbose = true;
+            continue;
+        }
         // 作用：加载外部标定文件，覆盖内置内参。实现：调 loadIntrinsicsFile，失败就把错误塞进 error 并停止解析。
         if (arg == "--calibration")
         {
@@ -522,6 +563,11 @@ void printUsage(std::ostream& out)
         "  --camera-timing-log   打印时钟校准结果和每帧时间戳\n"
         "  --no-imu              不用 C 板姿态，假定云台静止（串口可不接）\n"
         "  --log-observations    把每块装甲板的原始观测量写入 observations.csv\n"
+        "  --profile             每 50 帧打印一次各阶段平均耗时\n"
+        "  --detector-backend B  auto / trt / cuda / cpu，默认 auto（TensorRT→CUDA→CPU）\n"
+        "  --no-fp16             关闭 TensorRT FP16\n"
+        "  --trt-cache DIR       TensorRT engine 缓存目录，空字符串禁用\n"
+        "  --detector-verbose    打印 ORT / TensorRT 初始化日志\n"
         "  --serial PATH         串口设备\n"
         "  --baud N              串口波特率\n"
         "  --comm-latency S      通信延迟估计，秒\n"

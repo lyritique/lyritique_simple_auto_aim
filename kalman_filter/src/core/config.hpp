@@ -109,6 +109,19 @@ struct DetectorConfig
     bool ignore_purple {true};
     int num_color {4};
     int num_class {9};
+
+    // 推理后端：auto = TensorRT → CUDA → CPU 逐级回退；trt/cuda 只降不升；cpu 强制 CPU。
+    std::string backend {"auto"};
+    // TensorRT FP16，可用 --no-fp16 关闭。
+    bool fp16 {true};
+    // TensorRT engine / timing 缓存目录；空字符串表示禁用缓存。
+    std::string engine_cache_dir {"model/trt_cache"};
+    int trt_workspace_mb {512};
+    int trt_builder_opt_level {1};
+    // 小于该节点数的子图不交给 TensorRT，避免切出很多小 engine 拖慢构建。
+    int trt_min_subgraph_size {5};
+    // 打印 ORT / TensorRT 初始化日志，排查节点分配用。
+    bool detector_verbose {false};
 };
 
 struct SerialConfig
@@ -148,6 +161,9 @@ struct AppConfig
 
     // 把每块装甲板的原始观测量（YPD）单独落盘，标定 R 用。
     bool log_observations {false};
+
+    // 每 50 帧打印一次各阶段平均耗时，排查性能瓶颈用。
+    bool profile {false};
 
     double target_max_distance {2.5};
 };

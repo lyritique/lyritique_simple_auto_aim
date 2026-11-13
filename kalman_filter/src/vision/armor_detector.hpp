@@ -2,12 +2,15 @@
 # define AUTOAIM_ARMOR_DETECTOR_
 
 # include <array>
+# include <cstdint>
+# include <memory>
 # include <opencv2/core/types.hpp>
 # include <string>
 # include <vector>
 
 # include <opencv2/core.hpp>
 # include <opencv2/dnn.hpp>
+# include <onnxruntime_cxx_api.h>
 
 # include "core/config.hpp"
 
@@ -57,6 +60,22 @@ struct ArmorDetection
 
 using ArmorDetections = std::vector<ArmorDetection>;//早知道有这个
 
+// 推理后端。auto 由 Detector 内部展开成 TensorRT → CUDA → CPU。
+enum class Backend
+{
+    Cpu,
+    Cuda,
+    TensorRt
+};
+
+// 一次检测的三段耗时，排查性能瓶颈用。
+struct DetectTimings
+{
+    double preprocess_ms {};
+    double inference_ms {};
+    double postprocess_ms {};
+};
+
 class Detector
 {
     public:
@@ -67,6 +86,9 @@ class Detector
         ArmorDetections detect(const cv::Mat& bgr);
 
         const DetectorConfig& config() const noexcept { return config_; }
+
+        // 最近一次 detect 的分段耗时，只在启用 profiling 时打印。
+        const DetectTimings& timings() const noexcept { return timings_; }
 
     private:
         // letterbox 之后的网络输入，同时保存后处理需要的反变换参数
@@ -88,7 +110,21 @@ class Detector
         void nms(ArmorDetections& detections, float iou_threshold) const;
 
         DetectorConfig config_;
-        cv::dnn::Net net_;
+
+        // env_ 必须比 session_ 先声明，保证析构时 session 先释放、Env 后释放。
+        std::unique_ptr<Ort::Env> env_;
+        std::unique_ptr<Ort::Session> session_;
+        Ort::MemoryInfo memory_info_ {
+            Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)};
+        std::string input_name_;
+        std::string output_name_;
+        std::vector<const char*> input_names_;
+        std::vector<const char*> output_names_;
+        std::int64_t input_shape_[4] {1, 3, 0, 0};
+        Backend backend_ {Backend::Cpu};
+        bool fp16_active_ {false};
+
+        DetectTimings timings_ {};
 };
 
 }

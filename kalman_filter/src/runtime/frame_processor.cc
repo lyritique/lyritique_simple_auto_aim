@@ -3,6 +3,7 @@
 # include <opencv2/imgproc.hpp>
 
 # include <algorithm>
+# include <chrono>
 # include <cmath>
 # include <iostream>
 # include <utility>
@@ -84,6 +85,7 @@ FrameProcessor::FrameProcessor(const core::AppConfig& config)
     : detector_config_(config.detector),
       intrinsics_(config.intrinsics),
       target_max_distance_(config.target_max_distance),
+      profile_(config.profile),
       detector_(detector_config_),
       pnp_(intrinsics_)
 {
@@ -106,6 +108,7 @@ FrameProcessingResult FrameProcessor::process(
 {
     // 作用：先把这一帧的结果容器准备好，各字段默认零值。实现：栈上默认构造。
     FrameProcessingResult result;
+    const auto profile_frame_start = std::chrono::steady_clock::now();
 
     // 作用：画面尺寸和内参必须配套，不匹配就提醒一次，后面 PnP 的尺度都会歪。实现：比较行列数，只警告不拦帧。
     if (!size_warned_ &&
@@ -140,6 +143,7 @@ FrameProcessingResult FrameProcessor::process(
     cv::cvtColor(frame.bgr, gray, cv::COLOR_BGR2GRAY);
     // 作用：跑目标检测，拿到所有装甲板候选。实现：检测器直接吃彩色图。
     result.detections = detector_.detect(frame.bgr);
+    const auto profile_detect_done = std::chrono::steady_clock::now();
 
     // 作用：逐块板子过堂，能算位姿的才留。实现：遍历检测结果，内部完成细化、PnP、距离筛选和 EKF 投喂。
     for (const auto& detection : result.detections)
@@ -234,7 +238,6 @@ FrameProcessingResult FrameProcessor::process(
 
         // 作用：已初始化就正常更新，只拿一块板子更新一次，避免同帧重复喂。实现：update 后打个空行当调试分隔。
         ekf_.update(ekf_input, ypd);
-        std::cout << "\n";
     }
 
     // 作用：把初始化状态汇报出去，外部据此判断要不要信任结果。实现：拷贝成员标志。
@@ -245,6 +248,40 @@ FrameProcessingResult FrameProcessor::process(
         ekf_.renewArmorList();
         result.state = ekf_.getOutput();
         result.state_valid = result.state.valid;
+    }
+
+    // 作用：每 50 帧打一次分段平均，判断该砍推理还是砍后处理。实现：累加后打印并清零。
+    if (profile_)
+    {
+        const auto to_ms = [](const auto& from, const auto& to)
+        {
+            return std::chrono::duration<double, std::milli>(to - from).count();
+        };
+        const double detect_ms = to_ms(profile_frame_start, profile_detect_done);
+        const double total_ms =
+            to_ms(profile_frame_start, std::chrono::steady_clock::now());
+
+        profile_detect_ += detect_ms;
+        profile_pre_ += detector_.timings().preprocess_ms;
+        profile_inf_ += detector_.timings().inference_ms;
+        profile_post_ += detector_.timings().postprocess_ms;
+        profile_rest_ += total_ms - detect_ms;
+        ++profile_frames_;
+
+        if (profile_frames_ >= 50)
+        {
+            const double n = static_cast<double>(profile_frames_);
+            std::clog << "[profile] detect=" << profile_detect_ / n
+                      << "ms (pre " << profile_pre_ / n
+                      << " / inf " << profile_inf_ / n
+                      << " / post " << profile_post_ / n
+                      << ") rest=" << profile_rest_ / n
+                      << "ms total=" << (profile_detect_ + profile_rest_) / n
+                      << "ms\n";
+            profile_frames_ = 0;
+            profile_detect_ = profile_pre_ = profile_inf_ = 0.0;
+            profile_post_ = profile_rest_ = 0.0;
+        }
     }
 
     return result;

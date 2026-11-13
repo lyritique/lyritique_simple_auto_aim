@@ -50,21 +50,49 @@ src/
 - Eigen ≥ 3.4
 - GCC 支持 C++23
 - Hikrobot MVS SDK，默认安装在 `/opt/MVS`
+- ONNX Runtime GPU 包 ≥ 1.22（含 CPU / CUDA / TensorRT EP）
+- TensorRT 10.9 + CUDA 12.8 + cuDNN 9（TensorRT 版本必须与 ORT 预编译包对齐）
 
 ```bash
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
+  -DORT_ROOT=/path/to/onnxruntime \
   -DBUILD_TESTING=ON
 
 cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-MVS 不在默认位置时：
+MVS / ORT 不在默认位置时：
 
 ```bash
-cmake -S . -B build -DMVS_ROOT=/path/to/MVS
+cmake -S . -B build \
+  -DMVS_ROOT=/path/to/MVS \
+  -DORT_ROOT=/path/to/onnxruntime
 ```
+
+运行时需要让动态加载器找到 ONNX Runtime 的 provider 以及 TensorRT / CUDA 库：
+
+```bash
+export LD_LIBRARY_PATH=/path/to/onnxruntime/lib:/path/to/TensorRT/lib:/path/to/cuda/lib64:$LD_LIBRARY_PATH
+```
+
+## 检测后端
+
+推理通过 ONNX Runtime 执行，默认按 **TensorRT → CUDA → CPU** 自动降级；启动时会打印实际生效的后端。检测参数：
+
+| 参数 | 含义 |
+|---|---|
+| `--detector-backend auto\|trt\|cuda\|cpu` | 选择后端，默认 `auto` |
+| `--no-fp16` | 关闭 TensorRT FP16，做精度对照用 |
+| `--trt-cache DIR` | TensorRT engine / timing 缓存目录，默认 `model/trt_cache`，传空字符串禁用 |
+| `--detector-verbose` | 打印 ORT / TensorRT 初始化日志 |
+
+TensorRT 首次运行需要构建 engine，会在 `model/trt_cache` 下生成缓存；冷启动通常 1~3 分钟（取决于 builder 优化级别和显存/内存），之后复用缓存仍需数秒到十几秒完成反序列化。**缓存与 GPU 型号、模型、ORT / TensorRT 版本、FP16 设置绑定，升级任一组件或换机器后要删掉重建；不要提交到仓库。** 部署机建议先跑一次 `--replay` 预热缓存，再进实时模式。
+
+现场若 TensorRT 版本不匹配，直接 `--detector-backend cuda` 或 `cpu`，不需要改代码。
+
+> 注意：当前模型在 CUDA EP 下会被插入较多 Memcpy 节点，实测单帧推理反而比 CPU 慢；TRT 不可用时优先试 `cpu`，`cuda` 只作为排查手段。
 
 ## 离线回放
 
