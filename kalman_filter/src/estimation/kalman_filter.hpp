@@ -23,10 +23,10 @@ struct KalmanConfig
 
     //R
     //yac对角噪声
-    double ele {0.063};
-    double azi {0.063};
-    double k_dist {0.05};
-    double yaw {0.3};
+    double ele  {0.003};   // 1 mrad ≈ 1.9 mm @ 1.9 m
+    double azi  {0.003};
+    double k_dist {0.012}; // 0.8% 深度
+    double yaw  {0.012};   // 0.46°
 
 
 

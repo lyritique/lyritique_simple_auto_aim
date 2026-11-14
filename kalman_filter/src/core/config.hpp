@@ -61,6 +61,10 @@ struct CameraConfig
     bool chunk_exposure {true};
     // 打印时钟校准结果和每帧时间戳，台架实验用。
     bool timing_log {false};
+    // 设备时钟在线校准窗口（秒）。0 表示按 100 帧算；标定 ns/tick 时给几百秒。
+    double calib_seconds {0.0};
+    // 已知的每 tick 纳秒数。>0 就跳过斜率拟合直接用，长期标定后填这里。
+    double tick_ns {0.0};
 };
 
 // 场地曝光预设：曝光时间、增益、帧率三者必须一起配，改一个不改另一个会互相打架。

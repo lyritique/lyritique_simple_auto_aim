@@ -112,8 +112,8 @@ class Detector
         DetectorConfig config_;
 
         // env_ 必须比 session_ 先声明，保证析构时 session 先释放、Env 后释放。
-        std::unique_ptr<Ort::Env> env_;
-        std::unique_ptr<Ort::Session> session_;
+        std::unique_ptr<Ort::Env> env_;        //管理线程池、日志等全局资源
+        std::unique_ptr<Ort::Session> session_;//绑定到某个 .onnx 模型
         Ort::MemoryInfo memory_info_ {
             Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)};
         std::string input_name_;

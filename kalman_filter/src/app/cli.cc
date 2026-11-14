@@ -480,6 +480,32 @@ CliResult parseCommandLine(int argc, char** argv)
             result.config.detector.detector_verbose = true;
             continue;
         }
+        // 作用：设备时钟校准窗口，标定 ns/tick 时给几百秒。实现：写 camera.calib_seconds。
+        if (arg == "--camera-calib-seconds")
+        {
+            const auto* value = requireValue();
+            if (!value) break;
+            if (!parseDouble(*value, result.config.camera.calib_seconds) ||
+                result.config.camera.calib_seconds < 0.0)
+            {
+                result.error = "无效的校准时长: " + *value;
+                break;
+            }
+            continue;
+        }
+        // 作用：直接指定每 tick 纳秒数，跳过斜率拟合。实现：写 camera.tick_ns。
+        if (arg == "--camera-tick-ns")
+        {
+            const auto* value = requireValue();
+            if (!value) break;
+            if (!parseDouble(*value, result.config.camera.tick_ns) ||
+                result.config.camera.tick_ns <= 0.0)
+            {
+                result.error = "无效的 ns/tick: " + *value;
+                break;
+            }
+            continue;
+        }
         // 作用：加载外部标定文件，覆盖内置内参。实现：调 loadIntrinsicsFile，失败就把错误塞进 error 并停止解析。
         if (arg == "--calibration")
         {
@@ -561,6 +587,8 @@ void printUsage(std::ostream& out)
         "  --camera-exposure-anchor R  设备戳在曝光区间的比例，0~1，默认 0.5\n"
         "  --no-chunk-exposure   关闭 Chunk-Exposure，不读每帧曝光\n"
         "  --camera-timing-log   打印时钟校准结果和每帧时间戳\n"
+        "  --camera-calib-seconds S  设备时钟校准窗口，标定 ns/tick 时给几百秒\n"
+        "  --camera-tick-ns NS   直接指定每 tick 纳秒数，跳过拟合\n"
         "  --no-imu              不用 C 板姿态，假定云台静止（串口可不接）\n"
         "  --log-observations    把每块装甲板的原始观测量写入 observations.csv\n"
         "  --profile             每 50 帧打印一次各阶段平均耗时\n"
