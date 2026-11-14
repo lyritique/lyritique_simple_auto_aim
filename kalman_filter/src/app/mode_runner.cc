@@ -7,6 +7,7 @@
 # include <atomic>
 # include <csignal>
 # include <iostream>
+# include <memory>
 # include <string>
 # include <vector>
 
@@ -49,8 +50,17 @@ int runReplay(const core::AppConfig& config)
 // 作用：实时模式入口，负责起管线、挂信号、跑主循环、收尾打统计。实现：start → 注册 SIGINT/SIGTERM → run → 还原信号 → 打印计数。
 int runLive(const core::AppConfig& config)
 {
-    // 作用：建实时管线，配置原样传入。实现：栈上 RealtimePipeline 对象。
-    realtime::RealtimePipeline pipeline(config);
+    // 作用：建实时管线，配置原样传入。实现：构造失败（模型/GPU 初始化）时打印原因而不是 terminate。
+    std::unique_ptr<realtime::RealtimePipeline> pipeline;
+    try
+    {
+        pipeline = std::make_unique<realtime::RealtimePipeline>(config);
+    }
+    catch (const std::exception& error)
+    {
+        std::cerr << "实时模式初始化失败: " << error.what() << '\n';
+        return 1;
+    }
     // 作用：没有云台反馈时把前提说清楚，免得把结果当成真实标定结果。实现：imu_enabled 为假就提示一句。
     if (!config.imu_enabled)
     {
@@ -59,7 +69,7 @@ int runLive(const core::AppConfig& config)
     }
     // 作用：准备错误槽并尝试启动设备。实现：start 失败就打印原因并返回 1。
     std::string error;
-    if (!pipeline.start(&error))
+    if (!pipeline->start(&error))
     {
         std::cerr << "实时模式启动失败: " << error << '\n';
         return 1;
@@ -73,7 +83,7 @@ int runLive(const core::AppConfig& config)
     std::signal(SIGTERM, requestStop);
 
     // 作用：进主循环，直到有人喊停。实现：把停止标志交给 run，它自己管读帧和退出。
-    pipeline.run(stop_requested);
+    pipeline->run(stop_requested);
 
     // 作用：收工后把全局指针和信号处理还原，别影响后续代码。实现：指针置空，两个 signal 恢复 SIG_DFL。
     g_stop_requested = nullptr;
@@ -81,7 +91,7 @@ int runLive(const core::AppConfig& config)
     std::signal(SIGTERM, SIG_DFL);
 
     // 作用：打一份流水账，看看收了多少、丢了多少。实现：取 stats 快照后一次性输出四个计数。
-    const auto stats = pipeline.stats();
+    const auto stats = pipeline->stats();
     std::cout << "实时模式结束: frames=" << stats.processed_frames
               << " valid=" << stats.valid_frames
               << " dropped=" << stats.dropped_frames

@@ -89,6 +89,10 @@ private:
     int calib_frames_left_ {};
     std::vector<std::uint64_t> calib_ticks_;
     std::vector<double> calib_hosts_;
+    // 校准窗口时长（秒）。>0 时按时间收样本，用来长时间标定 ns/tick。
+    double calib_seconds_ {};
+    // 斜率是否直接采信相机节点，采信时不再用帧数据重新拟合。
+    bool scale_from_node_ {};
     // 校准完成后每帧对比映射时刻和收帧时刻，专门盯滞后是否持续增大。
     double last_host_time_ {};
     double last_warned_lag_ {};

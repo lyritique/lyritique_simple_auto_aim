@@ -95,6 +95,15 @@ private:
     // 作用：超过这个距离的板子不进 EKF，防止拿远处的噪声当目标。实现：double 阈值，process 里和 ypd.dist 比。
     double target_max_distance_ {};
 
+    // 作用：性能统计开关和累计器。实现：每帧累加，够 50 帧打一次平均再清零。
+    bool profile_ {};
+    int profile_frames_ {};
+    double profile_detect_ {};
+    double profile_pre_ {};
+    double profile_inf_ {};
+    double profile_post_ {};
+    double profile_rest_ {};
+
     // 作用：真正干检测的工人。实现：构造时用 detector_config_ 初始化。
     detector::Detector detector_;
     // 作用：PnP 解算器，负责把像素角点变成 3D 位姿。实现：构造时用 intrinsics_ 初始化，不再吃类内硬编码。

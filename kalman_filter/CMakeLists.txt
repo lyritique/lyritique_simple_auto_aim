@@ -25,6 +25,20 @@ find_library(
     REQUIRED
 )
 
+set(ORT_ROOT "/opt/onnxruntime" CACHE PATH "ONNX Runtime GPU root")
+find_path(
+    ORT_INCLUDE_DIR
+    NAMES onnxruntime_cxx_api.h
+    PATHS "${ORT_ROOT}/include"
+    REQUIRED
+)
+find_library(
+    ORT_LIBRARY
+    NAMES onnxruntime
+    PATHS "${ORT_ROOT}/lib"
+    REQUIRED
+)
+
 add_executable(
     kalman_filter
     src/app/cli.cc
@@ -53,6 +67,7 @@ target_include_directories(
         src/
         ${OpenCV_INCLUDE_DIRS}
         ${MVS_INCLUDE_DIR}
+        ${ORT_INCLUDE_DIR}
 )
 target_link_libraries(
     kalman_filter
@@ -60,12 +75,13 @@ target_link_libraries(
         Eigen3::Eigen
         ${OpenCV_LIBS}
         ${MVS_CAMERA_LIBRARY}
+        ${ORT_LIBRARY}
         Threads::Threads
 )
 set_target_properties(
     kalman_filter
     PROPERTIES
-        BUILD_RPATH "${MVS_ROOT}/lib/64"
+        BUILD_RPATH "${MVS_ROOT}/lib/64;${ORT_ROOT}/lib"
 )
 
 if(BUILD_TESTING)

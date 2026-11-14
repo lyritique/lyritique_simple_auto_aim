@@ -410,8 +410,16 @@ bool MvsCamera::open(std::string* error)
         }
         else if (!clock_ready_)
         {
-            std::clog << "提示: DeviceTimestamp 节点不可用，改用前 "
-                      << calib_frames_left_ << " 帧在线校准\n";
+            std::clog << "提示: DeviceTimestamp 节点不可用，改用 ";
+            if (calib_seconds_ > 0.0)
+            {
+                std::clog << calib_seconds_ << " 秒";
+            }
+            else
+            {
+                std::clog << calib_frames_left_ << " 帧";
+            }
+            std::clog << " 在线校准\n";
         }
     }
 
@@ -581,14 +589,37 @@ core::FrameReadStatus MvsCamera::read(
     // 节点校准不了（戳恒为 0 或只在出帧时跳）就用真实帧补：
     // 斜率（每秒多少 tick）必须从时间跨度里拟合出来 —— 相机报的 Increment 只是标称值，
     // 实际可能差百分之一，按标称值算会以每秒几毫秒的速度累积漂移。
-    if (!clock_ready_ && calib_frames_left_ > 0 &&
+    // 按时间收样本是长时间标定用的：窗口越长，收帧抖动被摊得越薄，斜率越准。
+    const bool time_based = calib_seconds_ > 0.0;
+    if (!clock_ready_ && (time_based || calib_frames_left_ > 0) &&
         config_.use_device_timestamp && device_ticks != 0)
     {
+        // 中途卡顿（TensorRT 首次建引擎、USB 抽风）会让这一段的斜率完全失真，
+        // 只要相邻样本间隔异常就丢掉整段重新攒。
+        constexpr double kMaxSampleGap = 0.5;
+        if (!calib_hosts_.empty() &&
+            host_time - calib_hosts_.back() > kMaxSampleGap)
+        {
+            calib_ticks_.clear();
+            calib_hosts_.clear();
+            calib_frames_left_ = kFrameCalibFrames;
+        }
+
         calib_ticks_.push_back(device_ticks);
         calib_hosts_.push_back(host_time);
-        --calib_frames_left_;
 
-        if (calib_frames_left_ == 0)
+        bool finished = false;
+        if (time_based)
+        {
+            finished = !calib_hosts_.empty() &&
+                (host_time - calib_hosts_.front() >= calib_seconds_);
+        }
+        else
+        {
+            finished = (--calib_frames_left_ == 0);
+        }
+
+        if (finished)
         {
             const std::size_t n = calib_ticks_.size();
             double mean_t = 0.0;
@@ -611,9 +642,12 @@ core::FrameReadStatus MvsCamera::read(
                 var += dt * dt;
             }
 
-            // 斜率 = 每 tick 多少秒。拟合不出来（窗口内没跨度）就保留标称值。
+            // 斜率 = 每 tick 多少秒。已经给定 tick_ns 就不再拟合，避免被窗口噪声带偏。
+            // 节点已经给出可信斜率时不再用帧数据覆盖它 —— 收帧抖动只会把斜率带偏。
+            // 但仍然算一个实测值打出来，方便和节点值对账。
             const double fitted = var > 0.0 ? cov / var : 0.0;
-            if (fitted >= 5e-9 && fitted <= 2e-8)
+            const bool fitted_ok = fitted >= 5e-9 && fitted <= 2e-8;
+            if (config_.tick_ns <= 0.0 && !scale_from_node_ && fitted_ok)
             {
                 clock_scale_ = fitted;
             }
@@ -637,8 +671,11 @@ core::FrameReadStatus MvsCamera::read(
             clock_offset_ = best;
             clock_spread_ms_ = 0.0;
             clock_ready_ = true;
-            std::clog << "[相机时钟] 帧校准完成 ns/tick="
-                      << clock_scale_ * 1e9 << " 样本=" << n << '\n';
+            std::clog << "[相机时钟] 校准完成 ns/tick="
+                      << clock_scale_ * 1e9
+                      << (scale_from_node_ ? "（节点值）" : "（拟合值）")
+                      << " 实测=" << (fitted_ok ? fitted * 1e9 : 0.0)
+                      << " 样本=" << n << '\n';
             // 校准期间 last_frame_timestamp_ 记的是收帧时刻，换到设备时刻会"倒退"，
             // 不清掉就会被单调性护栏一直钳成 host_time。
             last_frame_timestamp_ = 0.0;
@@ -762,6 +799,7 @@ void MvsCamera::close()
     calib_frames_left_ = 0;
     calib_ticks_.clear();
     calib_hosts_.clear();
+    calib_seconds_ = 0.0;
     last_frame_timestamp_ = 0.0;
 }
 
@@ -791,18 +829,28 @@ bool MvsCamera::calibrateDeviceClock(std::string* error)
     calib_frames_left_ = 0;
     calib_ticks_.clear();
     calib_hosts_.clear();
+    calib_seconds_ = config_.calib_seconds;
 
-    // 多数型号的 DeviceTimestamp 直接是 ns；万一按 tick 计，用 Increment 换算。
-    // 但各型号对这个节点的解释不一致：小于 1e6 的当成「每 tick 多少纳秒」，
-    // 更大的当成「每秒多少 tick」（即频率 Hz）。搞反了时间戳会成倍漂移。
-    clock_scale_ = 1e-9;
-    MVCC_INTVALUE_EX increment {};
-    if (MV_CC_GetIntValueEx(
-            handle_, "DeviceTimestampIncrement", &increment) == MV_OK &&
-        increment.nCurValue > 0)
+    // 已经用长基线标定过就直接用给定值，不再让窗口噪声左右斜率。
+    if (config_.tick_ns > 0.0)
     {
-        const double raw = static_cast<double>(increment.nCurValue);
-        clock_scale_ = raw >= 1e6 ? 1.0 / raw : raw * 1e-9;
+        clock_scale_ = config_.tick_ns * 1e-9;
+    }
+
+    // 没给 tick_ns 时才去问节点；给了就以配置为准。
+    scale_from_node_ = config_.tick_ns > 0.0;
+    if (config_.tick_ns <= 0.0)
+    {
+        clock_scale_ = 1e-9;
+        MVCC_INTVALUE_EX increment {};
+        if (MV_CC_GetIntValueEx(
+                handle_, "DeviceTimestampIncrement", &increment) == MV_OK &&
+            increment.nCurValue > 0)
+        {
+            const double raw = static_cast<double>(increment.nCurValue);
+            clock_scale_ = raw >= 1e6 ? 1.0 / raw : raw * 1e-9;
+            scale_from_node_ = true;
+        }
     }
 
     // 只在读节点的瞬间配对，不掺入图像传输延迟，否则等于没换。

@@ -1,9 +1,13 @@
 # include "vision/armor_detector.hpp"
 
 # include <algorithm>
+# include <chrono>
 # include <cmath>
+# include <filesystem>
+# include <iostream>
 #include <opencv2/core/types.hpp>
 # include <stdexcept>
+# include <string>
 # include <utility>
 
 # include <opencv2/imgproc.hpp>
@@ -17,6 +21,134 @@ namespace
     // 当前模型约定：HERO 和 BASE_B 使用大装甲板
     constexpr int kHeroClass = 1;
     constexpr int kBaseBottomClass = 7;
+
+    const char* backendName(Backend backend)
+    {
+        switch (backend)
+        {
+            case Backend::TensorRt: return "TensorRT";
+            case Backend::Cuda: return "CUDA";
+            case Backend::Cpu: return "CPU";
+        }
+        return "Unknown";
+    }
+
+    // 把 CLI 的字符串展开成候选链：只降不升，CPU 永远是最后兜底。
+    std::vector<Backend> candidateBackends(const std::string& requested)
+    {
+        if (requested == "cpu") return {Backend::Cpu};
+        if (requested == "cuda") return {Backend::Cuda, Backend::Cpu};
+        return {Backend::TensorRt, Backend::Cuda, Backend::Cpu};
+    }
+
+    // ORT 的 provider 列表只取决于安装包，进程内不会变化，缓存一次即可。
+    bool providerAvailable(const char* name)
+    {
+        static const std::vector<std::string> providers =
+            Ort::GetAvailableProviders();
+        return std::find(providers.begin(), providers.end(), name) !=
+               providers.end();
+    }
+
+    // 每个候选后端都新建一份 SessionOptions，避免失败后带着半套 EP 状态重试。
+    Ort::SessionOptions makeOptions(Backend backend,
+                                    const DetectorConfig& config)
+    {
+        Ort::SessionOptions options;
+        options.SetGraphOptimizationLevel(
+            GraphOptimizationLevel::ORT_ENABLE_ALL);
+        // 单帧同步推理，多线程只会互相抢核。
+        options.SetIntraOpNumThreads(1);
+        options.SetInterOpNumThreads(1);
+        options.SetLogSeverityLevel(
+            config.detector_verbose ? ORT_LOGGING_LEVEL_VERBOSE
+                                    : ORT_LOGGING_LEVEL_WARNING);
+
+        const OrtApi& api = Ort::GetApi();
+
+        if (backend == Backend::TensorRt)
+        {
+            OrtTensorRTProviderOptionsV2* trt_options = nullptr;
+            Ort::ThrowOnError(api.CreateTensorRTProviderOptions(&trt_options));
+
+            const auto release = [&api](OrtTensorRTProviderOptionsV2* pointer)
+            {
+                if (pointer != nullptr)
+                {
+                    api.ReleaseTensorRTProviderOptions(pointer);
+                }
+            };
+            const std::unique_ptr<OrtTensorRTProviderOptionsV2,
+                                  decltype(release)>
+                guard(trt_options, release);
+
+            // keys 存常量名，values 存字符串本体；value_ptrs 最后统一取地址，
+            // 避免把临时 string 的 c_str() 存进 vector。
+            std::vector<const char*> keys;
+            std::vector<std::string> values;
+            const auto add = [&](const char* key, std::string value)
+            {
+                keys.push_back(key);
+                values.push_back(std::move(value));
+            };
+
+            add("device_id", "0");
+            add("trt_fp16_enable", config.fp16 ? "1" : "0");
+            add("trt_max_workspace_size",
+                std::to_string(
+                    static_cast<long long>(config.trt_workspace_mb) * 1024LL *
+                    1024LL));
+            add("trt_builder_optimization_level",
+                std::to_string(config.trt_builder_opt_level));
+            add("trt_min_subgraph_size",
+                std::to_string(config.trt_min_subgraph_size));
+            add("trt_engine_cache_enable",
+                config.engine_cache_dir.empty() ? "0" : "1");
+
+            if (!config.engine_cache_dir.empty())
+            {
+                const std::string model_stem =
+                    std::filesystem::path(config.model_path)
+                        .stem()
+                        .string();
+                add("trt_engine_cache_path", config.engine_cache_dir);
+                add("trt_engine_cache_prefix",
+                    model_stem + (config.fp16 ? "_fp16" : "_fp32"));
+                add("trt_timing_cache_enable", "1");
+                add("trt_timing_cache_path", config.engine_cache_dir);
+            }
+            if (config.detector_verbose)
+            {
+                add("trt_dump_subgraphs", "1");
+            }
+
+            std::vector<const char*> value_ptrs;
+            value_ptrs.reserve(values.size());
+            for (const std::string& value : values)
+            {
+                value_ptrs.push_back(value.c_str());
+            }
+
+            Ort::ThrowOnError(api.UpdateTensorRTProviderOptions(
+                trt_options, keys.data(), value_ptrs.data(),
+                static_cast<int>(keys.size())));
+            Ort::ThrowOnError(
+                api.SessionOptionsAppendExecutionProvider_TensorRT_V2(
+                    options, trt_options));
+        }
+
+        // TRT 不支持的算子需要 CUDA 接住，否则会掉到 CPU。
+        if (backend == Backend::TensorRt || backend == Backend::Cuda)
+        {
+            OrtCUDAProviderOptions cuda_options {};
+            cuda_options.device_id = 0;
+            Ort::ThrowOnError(
+                api.SessionOptionsAppendExecutionProvider_CUDA(
+                    options, &cuda_options));
+        }
+
+        return options;
+    }
 }
 
 
@@ -40,22 +172,132 @@ Detector::Detector(const DetectorConfig& config)
     {
         throw std::invalid_argument("Detector: ignore_color 超出颜色分支范围");
     }
-
-    //启动model
-    try
+    if (config_.backend != "auto" && config_.backend != "trt" &&
+        config_.backend != "cuda" && config_.backend != "cpu")
     {
-        net_ = cv::dnn::readNetFromONNX(config_.model_path);
-    }
-    catch (const cv::Exception& e)
-    {
-        throw std::runtime_error("Detector: 加载 ONNX 模型失败: " +
-                                 config_.model_path + "\n" + e.what());
+        throw std::invalid_argument("Detector: 未知推理后端: " + config_.backend);
     }
 
-    if (net_.empty())
+    env_ = std::make_unique<Ort::Env>(
+        config_.detector_verbose ? ORT_LOGGING_LEVEL_VERBOSE
+                                 : ORT_LOGGING_LEVEL_WARNING,
+        "auto_aim");
+
+    if (!config_.engine_cache_dir.empty())
     {
-        throw std::runtime_error("Detector: ONNX 模型为空: " + config_.model_path);
+        std::error_code error;
+        std::filesystem::create_directories(config_.engine_cache_dir, error);
+        if (error)
+        {
+            std::clog << "[detector] 无法创建 engine 缓存目录 "
+                      << config_.engine_cache_dir << ": " << error.message()
+                      << "，本次不使用缓存\n";
+            config_.engine_cache_dir.clear();
+        }
     }
+
+    std::string last_error;
+    for (const Backend candidate : candidateBackends(config_.backend))
+    {
+        if (candidate == Backend::TensorRt &&
+            !providerAvailable("TensorrtExecutionProvider"))
+        {
+            last_error = "ONNX Runtime 未提供 TensorRT EP";
+            std::clog << "[detector] " << last_error << "，尝试下一个后端\n";
+            continue;
+        }
+        if (candidate == Backend::Cuda &&
+            !providerAvailable("CUDAExecutionProvider"))
+        {
+            last_error = "ONNX Runtime 未提供 CUDA EP";
+            std::clog << "[detector] " << last_error << "，尝试下一个后端\n";
+            continue;
+        }
+
+        try
+        {
+            const auto session_start = std::chrono::steady_clock::now();
+            Ort::SessionOptions options = makeOptions(candidate, config_);
+            session_ = std::make_unique<Ort::Session>(
+                *env_, config_.model_path.c_str(), options);
+            const auto session_end = std::chrono::steady_clock::now();
+
+            Ort::AllocatorWithDefaultOptions allocator;
+            input_name_ = session_->GetInputNameAllocated(0, allocator).get();
+            output_name_ = session_->GetOutputNameAllocated(0, allocator).get();
+            input_names_ = {input_name_.c_str()};
+            output_names_ = {output_name_.c_str()};
+
+            const std::vector<std::int64_t> model_shape =
+                session_->GetInputTypeInfo(0)
+                    .GetTensorTypeAndShapeInfo()
+                    .GetShape();
+            if (model_shape.size() != 4)
+            {
+                throw std::runtime_error("Detector: 模型输入不是 4 维张量");
+            }
+
+            // 动态维（-1）用配置值补，静态维必须和配置一致。
+            input_shape_[0] = 1;
+            input_shape_[1] = 3;
+            input_shape_[2] =
+                model_shape[2] > 0 ? model_shape[2] : config_.input_height;
+            input_shape_[3] =
+                model_shape[3] > 0 ? model_shape[3] : config_.input_width;
+            if (input_shape_[2] != config_.input_height ||
+                input_shape_[3] != config_.input_width)
+            {
+                throw std::runtime_error(
+                    "Detector: 模型输入尺寸 " +
+                    std::to_string(input_shape_[3]) + "x" +
+                    std::to_string(input_shape_[2]) + " 与配置 " +
+                    std::to_string(config_.input_width) + "x" +
+                    std::to_string(config_.input_height) + " 不一致");
+            }
+
+            // 首次 Run 可能触发 TensorRT engine 构建，必须在这里吃掉。
+            std::vector<float> warmup_data(
+                static_cast<std::size_t>(input_shape_[1] * input_shape_[2] *
+                                         input_shape_[3]),
+                0.0F);
+            Ort::Value warmup_tensor = Ort::Value::CreateTensor<float>(
+                memory_info_, warmup_data.data(), warmup_data.size(),
+                input_shape_, 4);
+            const auto warmup_start = std::chrono::steady_clock::now();
+            session_->Run(Ort::RunOptions {nullptr}, input_names_.data(),
+                          &warmup_tensor, 1, output_names_.data(), 1);
+            const auto warmup_end = std::chrono::steady_clock::now();
+
+            backend_ = candidate;
+            fp16_active_ = candidate == Backend::TensorRt && config_.fp16;
+
+            const auto to_ms = [](const auto& begin, const auto& end)
+            {
+                return std::chrono::duration<double, std::milli>(end - begin)
+                    .count();
+            };
+            std::clog << "[detector] backend=" << backendName(backend_)
+                      << " fp16=" << (fp16_active_ ? 1 : 0) << " cache="
+                      << (config_.engine_cache_dir.empty()
+                              ? "off"
+                              : config_.engine_cache_dir)
+                      << " session=" << to_ms(session_start, session_end)
+                      << "ms warmup=" << to_ms(warmup_start, warmup_end)
+                      << "ms\n";
+            return;
+        }
+        catch (const Ort::Exception& error)
+        {
+            last_error = error.what();
+            session_.reset();
+            std::clog << "[detector] " << backendName(candidate)
+                      << " 初始化失败: " << error.what()
+                      << "，尝试下一个后端\n";
+        }
+    }
+
+    throw std::runtime_error(
+        "Detector: 没有可用的推理后端；最后一次错误: " + last_error);
 }
 
 
@@ -134,23 +376,60 @@ ArmorDetections Detector::detect(const cv::Mat& bgr)
         throw std::invalid_argument("Detector::detect 需要 CV_8UC3 的 BGR 图像");
     }
 
-    const Blob input = makeBlob(bgr);
+    // 三段计时：预处理、推理、后处理。加起来就是单帧检测的净开销。
+    const auto stage_start = std::chrono::steady_clock::now();
+    Blob input = makeBlob(bgr);
     if (input.blob.empty() || input.info.scale <= 0.0f) return detections;
+    const auto preprocess_done = std::chrono::steady_clock::now();
 
-    cv::Mat output;
+    std::vector<Ort::Value> outputs;
     try
     {
-        net_.setInput(input.blob);
-        output = net_.forward();  // 当前模型输出形状为 [1, 21, 6300]
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info_, input.blob.ptr<float>(), input.blob.total(),
+            input_shape_, 4);
+        outputs = session_->Run(Ort::RunOptions {nullptr}, input_names_.data(),
+                                &input_tensor, 1, output_names_.data(), 1);
     }
-    catch (const cv::Exception& e)
+    catch (const Ort::Exception& error)
     {
         throw std::runtime_error(
-            std::string("Detector: YOLO 前向推理失败: ") + e.what());
+            std::string("Detector: YOLO 前向推理失败: ") + error.what());
     }
+    const auto inference_done = std::chrono::steady_clock::now();
+
+    if (outputs.empty())
+    {
+        throw std::runtime_error("Detector: 推理没有返回输出");
+    }
+
+    // 输出 [1,21,6300] 是连续的 float，包成无拷贝的 cv::Mat 头交给 decode。
+    // outputs 必须活到 decode 结束；这里保持在函数作用域内即可。
+    Ort::Value& output_tensor = outputs.front();
+    const std::vector<std::int64_t> output_shape =
+        output_tensor.GetTensorTypeAndShapeInfo().GetShape();
+    if (output_shape.size() != 3)
+    {
+        throw std::runtime_error("Detector: 模型输出不是 3 维张量");
+    }
+    const int dims[3] = {static_cast<int>(output_shape[0]),
+                         static_cast<int>(output_shape[1]),
+                         static_cast<int>(output_shape[2])};
+    cv::Mat output(3, dims, CV_32F,
+                   output_tensor.GetTensorMutableData<float>());
 
     decode(output, input, bgr.cols, bgr.rows, detections);
     nms(detections, config_.nms_threshold);
+    const auto postprocess_done = std::chrono::steady_clock::now();
+
+    const auto to_ms = [](const auto& a, const auto& b)
+    {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    timings_.preprocess_ms = to_ms(stage_start, preprocess_done);
+    timings_.inference_ms = to_ms(preprocess_done, inference_done);
+    timings_.postprocess_ms = to_ms(inference_done, postprocess_done);
+
     return detections;
 }
 
