@@ -282,6 +282,10 @@ PipelineFrameResult RealtimePipeline::processFrame(
         ++stats_.processed_frames;
     }
 
+    // 作用：先跑检测，检测不依赖姿态。实现：单独调 processor_.detect。
+    // 这么排是因为推理要几毫秒，这段时间正好够 IMU 包落地，后面拿姿态就不用干等。
+    const auto detections = processor_.detect(frame);
+
     // 作用：去历史里找这一帧时刻的云台姿态。实现：调 waitForAttitude，带超时等待。
     kalfilter::GimbalSample attitude;
     // 作用：无 IMU 时用单位四元数顶替，世界系就等于初始相机系。实现：imu_enabled 为假才走这一支。
@@ -320,9 +324,9 @@ PipelineFrameResult RealtimePipeline::processFrame(
     const Eigen::Matrix3d R_C0C =
         q_relative.toRotationMatrix();
 
-    // 作用：把帧和旋转交给下游处理器，走检测、PnP、EKF。实现：一次 process 调用全套。
+    // 作用：把帧、检测结果和旋转交给下游处理器，走细化、PnP、EKF。实现：一次 solve 调用全套。
     const FrameProcessingResult processing =
-        processor_.process(frame, R_C0C);
+        processor_.solve(frame, detections, R_C0C);
     // 作用：把有效检测数、滤波状态、可信标志搬进对外结果。实现：逐字段赋值，检测数取 observations 大小。
     result.valid_detections = static_cast<int>(
         processing.observations.size());
@@ -396,12 +400,23 @@ bool RealtimePipeline::waitForAttitude(
         if (history_.interpolate(host_time, sample)) return true;
         // 作用：链路都停了就别等了。实现：running_ 为假返回 false。
         if (!running_.load()) return false;
-        // 作用：等到头还没来，只能放弃这帧。实现：当前时间超过 deadline 返回 false。
-        if (std::chrono::steady_clock::now() >= deadline) return false;
+        // 作用：等到头还没来，就别再堵了。实现：超期直接跳出循环去外推。
+        if (std::chrono::steady_clock::now() >= deadline) break;
         // 作用：别死循环烧 CPU，小睡 1ms 再问。实现：sleep_for 一毫秒。
         std::this_thread::sleep_for(
             std::chrono::milliseconds(1));
     }
+
+    // 作用：包还没到就用角速度把姿态推到该帧时刻，最多推 max_prediction_seconds。
+    // 实现：history_.predict 内部限制外推距离，推不了就返回假。
+    if (history_.predict(host_time, sample))
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.extrapolated_attitude;
+        return true;
+    }
+
+    return false;
 }
 
 // 作用：后台线程专收 C 板反馈，收一条处理一条。实现：poll 循环把串口缓冲抽干，没收到包就睡 1ms，直到停机。

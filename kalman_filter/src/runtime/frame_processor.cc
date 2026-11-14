@@ -101,15 +101,11 @@ void FrameProcessor::reset()
     last_frame_time_ = 0.0;
 }
 
-// 作用：处理一帧，输出检测、位姿和滤波状态。实现：先补一次预测，再检测 + 双 PnP 择优，最后按距离筛选后送进 EKF。
-FrameProcessingResult FrameProcessor::process(
-    const core::TimestampedFrame& frame,
-    const Eigen::Matrix3d& R_C0C)
+// 作用：只跑检测，不碰云台姿态。实现：尺寸检查一次，然后交给检测器。
+// 单独拆出来是为了让实时链路先做检测，把等 IMU 的时间盖在推理下面。
+detector::ArmorDetections FrameProcessor::detect(
+    const core::TimestampedFrame& frame)
 {
-    // 作用：先把这一帧的结果容器准备好，各字段默认零值。实现：栈上默认构造。
-    FrameProcessingResult result;
-    const auto profile_frame_start = std::chrono::steady_clock::now();
-
     // 作用：画面尺寸和内参必须配套，不匹配就提醒一次，后面 PnP 的尺度都会歪。实现：比较行列数，只警告不拦帧。
     if (!size_warned_ &&
         (frame.bgr.cols != intrinsics_.width ||
@@ -121,6 +117,20 @@ FrameProcessingResult FrameProcessor::process(
                   << intrinsics_.height
                   << " 不一致，PnP 结果可能不准\n";
     }
+
+    return detector_.detect(frame.bgr);
+}
+
+// 作用：拿检测结果做客位姿和滤波。实现：补一次预测，逐块细化 + PnP，按距离筛选后送进 EKF。
+FrameProcessingResult FrameProcessor::solve(
+    const core::TimestampedFrame& frame,
+    const detector::ArmorDetections& detections,
+    const Eigen::Matrix3d& R_C0C)
+{
+    // 作用：先把这一帧的结果容器准备好，各字段默认零值。实现：栈上默认构造。
+    FrameProcessingResult result;
+    result.detections = detections;
+    const auto profile_frame_start = std::chrono::steady_clock::now();
 
     // 作用：只有上过战场才知道该走多远，首帧不预测。实现：已初始化且有上帧时间才继续。
     if (ekf_initialized_ && has_last_frame_time_)
@@ -141,9 +151,6 @@ FrameProcessingResult FrameProcessor::process(
     // 作用：准备灰度图，亚像素细化只吃它。实现：cvtColor 做 BGR2GRAY。
     cv::Mat gray;
     cv::cvtColor(frame.bgr, gray, cv::COLOR_BGR2GRAY);
-    // 作用：跑目标检测，拿到所有装甲板候选。实现：检测器直接吃彩色图。
-    result.detections = detector_.detect(frame.bgr);
-    const auto profile_detect_done = std::chrono::steady_clock::now();
 
     // 作用：逐块板子过堂，能算位姿的才留。实现：遍历检测结果，内部完成细化、PnP、距离筛选和 EKF 投喂。
     for (const auto& detection : result.detections)
@@ -237,7 +244,7 @@ FrameProcessingResult FrameProcessor::process(
         }
 
         // 作用：已初始化就正常更新，只拿一块板子更新一次，避免同帧重复喂。实现：update 后打个空行当调试分隔。
-        ekf_.update(ekf_input, ypd);
+        ekf_.update(ekf_input, ypd, R_C0C);
     }
 
     // 作用：把初始化状态汇报出去，外部据此判断要不要信任结果。实现：拷贝成员标志。
@@ -257,15 +264,18 @@ FrameProcessingResult FrameProcessor::process(
         {
             return std::chrono::duration<double, std::milli>(to - from).count();
         };
-        const double detect_ms = to_ms(profile_frame_start, profile_detect_done);
-        const double total_ms =
+        // 检测耗时来自检测器自己记的三段，解算耗时取 solve 的墙钟。
+        const double detect_ms = detector_.timings().preprocess_ms +
+            detector_.timings().inference_ms +
+            detector_.timings().postprocess_ms;
+        const double solve_ms =
             to_ms(profile_frame_start, std::chrono::steady_clock::now());
 
         profile_detect_ += detect_ms;
         profile_pre_ += detector_.timings().preprocess_ms;
         profile_inf_ += detector_.timings().inference_ms;
         profile_post_ += detector_.timings().postprocess_ms;
-        profile_rest_ += total_ms - detect_ms;
+        profile_rest_ += solve_ms;
         ++profile_frames_;
 
         if (profile_frames_ >= 50)
@@ -275,7 +285,7 @@ FrameProcessingResult FrameProcessor::process(
                       << "ms (pre " << profile_pre_ / n
                       << " / inf " << profile_inf_ / n
                       << " / post " << profile_post_ / n
-                      << ") rest=" << profile_rest_ / n
+                      << ") solve=" << profile_rest_ / n
                       << "ms total=" << (profile_detect_ + profile_rest_) / n
                       << "ms\n";
             profile_frames_ = 0;
@@ -285,6 +295,14 @@ FrameProcessingResult FrameProcessor::process(
     }
 
     return result;
+}
+
+// 作用：回放等场景一把梭，检测和解算连着做。实现：先 detect 再 solve。
+FrameProcessingResult FrameProcessor::process(
+    const core::TimestampedFrame& frame,
+    const Eigen::Matrix3d& R_C0C)
+{
+    return solve(frame, detect(frame), R_C0C);
 }
 
 }   // namespace realtime

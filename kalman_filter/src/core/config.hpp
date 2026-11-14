@@ -140,7 +140,9 @@ struct TimingConfig
     double max_history_seconds {2.0};
     double max_attitude_gap_seconds {0.1};
     double max_attitude_prediction_seconds {0.05};
-    double attitude_wait_ms {30.0};
+    // 等姿态的宽限。检测已经先跑了，这里只兜"包刚好在路上"的几毫秒；
+    // 等不到就外推，不要再把整帧堵住。
+    double attitude_wait_ms {2.0};
     double replay_imu_offset_seconds {0.009};
 };
 
