@@ -1,125 +1,103 @@
-# ifndef AUTOAIM_ESTIMATION_KALMAN_FILTER_HPP
-# define AUTOAIM_ESTIMATION_KALMAN_FILTER_HPP
+#ifndef AUTOAIM_ESTIMATION_KALMAN_FILTER_HPP
+#define AUTOAIM_ESTIMATION_KALMAN_FILTER_HPP
 
-# include <limits>
-
-# include <eigen3/Eigen/Eigen>
-# include <vector>
-
-
-
+#include <eigen3/Eigen/Eigen>
+#include <limits>
+#include <vector>
 
 namespace kalfilter {
 
-struct KalmanConfig
-{
-    
+struct KalmanConfig {
+  // Q
+  double p_coord = 10;
+  double p_yaw = 10;
+  double p_r{1e-6};
 
+  // R
+  // yac对角噪声
+  double ele{0.003};  // 1 mrad ≈ 1.9 mm @ 1.9 m
+  double azi{0.003};
+  double k_dist{0.012};  // 0.8% 深度
+  double yaw{0.012};     // 0.46°
 
-    //Q
-    double p_coord = 10;
-    double p_yaw = 10;
-    double p_r {1e-6};
+  double assoc_pos_gate{2.5};
+  double max_yaw_innovation{0.7853981633974483};  // 45 度
+  double chi2_gate{9.49};
 
-    //R
-    //yac对角噪声
-    double ele  {0.003};   // 1 mrad ≈ 1.9 mm @ 1.9 m
-    double azi  {0.003};
-    double k_dist {0.012}; // 0.8% 深度
-    double yaw  {0.012};   // 0.46°
+  // 狠狠限制r的协方差
+  double kRadiusSigma = 1e-4;
 
+  // 初始化不确定度（原来用 P.setIdentity() 当协方差，位置方差 1 m^2 太离谱）
+  double init_sigma_pos{0.05};  // m
+  double init_sigma_vel{4.0};   // m/s
+  double init_sigma_yaw{0.25};  // rad
+  double init_sigma_vyaw{6.0};  // rad/s
 
-
-    double assoc_pos_gate {2.5};
-    double max_yaw_innovation {0.7853981633974483};  // 45 度
-    double chi2_gate {9.49};
-
-    //狠狠限制r的协方差
-    double kRadiusSigma = 1e-4;
-
-     //初始化不确定度（原来用 P.setIdentity() 当协方差，位置方差 1 m^2 太离谱）
-    double init_sigma_pos {0.05};    // m
-    double init_sigma_vel {4.0};     // m/s
-    double init_sigma_yaw {0.25};    // rad
-    double init_sigma_vyaw {6.0};    // rad/s
-
-    // 多久没有新观测就让状态失效。纯靠预测外推越久越离谱，云台会照着空想的角度转。
-    double lost_timeout {0.3};       // s
+  // 多久没有新观测就让状态失效。纯靠预测外推越久越离谱，云台会照着空想的角度转。
+  double lost_timeout{0.3};  // s
 };
 
-//相机系球坐标，用于求R观测噪声协方差矩阵，噪声天然的坐标系是 YPD
-struct cam_ypd
-{
-    double azi {};
-    double ele {};
-    double dist {};
+// 相机系球坐标，用于求R观测噪声协方差矩阵，噪声天然的坐标系是 YPD
+struct cam_ypd {
+  double azi{};
+  double ele{};
+  double dist{};
 };
 
-
-struct ObsAssociation {                     
-    int    id = -1;                            // 匹配到的 id
-    double d2 = std::numeric_limits<double>::infinity();
-    bool   valid = false;                      // 是否通过门限
-    Eigen::Matrix<double,4,1> nu  {};              // 残差（yaw 已 wrap）
-    Eigen::Matrix<double,4,9> H   {};               // 雅可比
-    Eigen::Matrix4d           Sinv{};            // S 的逆，供更新复用
+struct ObsAssociation {
+  int id = -1;  // 匹配到的 id
+  double d2 = std::numeric_limits<double>::infinity();
+  bool valid = false;                // 是否通过门限
+  Eigen::Matrix<double, 4, 1> nu{};  // 残差（yaw 已 wrap）
+  Eigen::Matrix<double, 4, 9> H{};   // 雅可比
+  Eigen::Matrix4d Sinv{};            // S 的逆，供更新复用
 };
 
-struct armerState 
-{
-    Eigen::Matrix<double,4,1> measurement;
-    kalfilter::ObsAssociation testResult;
+struct armerState {
+  Eigen::Matrix<double, 4, 1> measurement;
+  kalfilter::ObsAssociation testResult;
 };
 
-struct storedID 
-{
-    int  id {};      // 0~3
-    bool isThisFrame =false;
+struct storedID {
+  int id{};  // 0~3
+  bool isThisFrame = false;
 };
 
-struct KFResult
-{
-    //px, py, pz, yaw, vx, vy, vz, vyaw, r
-    Eigen::Matrix<double, 9, 1> state =Eigen::Matrix<double, 9, 1>::Zero();
-    bool valid = false;
+struct KFResult {
+  // px, py, pz, yaw, vx, vy, vz, vyaw, r
+  Eigen::Matrix<double, 9, 1> state = Eigen::Matrix<double, 9, 1>::Zero();
+  bool valid = false;
 };
 
-class KalmanFilter
-{
-    public: 
-        explicit KalmanFilter(const KalmanConfig& config = KalmanConfig{});
+class KalmanFilter {
+ public:
+  explicit KalmanFilter(const KalmanConfig& config = KalmanConfig{});
 
-        void init(armerState& measurement);
-        void reset();
-        void predict(const double& dt);
-        // R_C0C 把观测噪声从相机系转到世界系，必须和 measurement 用同一个旋转。
-        void update(armerState& armor ,const cam_ypd& ypd,
-                    const Eigen::Matrix3d& R_C0C);
-        //这个是每一帧的结束处理id_list的
-        void renewArmorList ();
-        KFResult getOutput() const;
-    private:
-        
-        
-        Eigen::Matrix<double,9,1> X {};  //X=(px,py,pz,yaw,vx,vy,vz,vyaw,r)
-        Eigen::Matrix<double,9,9> P {};
-        Eigen::Matrix<double,9,9> F {};
+  void init(armerState& measurement);
+  void reset();
+  void predict(const double& dt);
+  // R_C0C 把观测噪声从相机系转到世界系，必须和 measurement 用同一个旋转。
+  void update(armerState& armor, const cam_ypd& ypd, const Eigen::Matrix3d& R_C0C);
+  // 这个是每一帧的结束处理id_list的
+  void renewArmorList();
+  KFResult getOutput() const;
 
-        bool initialized = false;
+ private:
+  Eigen::Matrix<double, 9, 1> X{};  // X=(px,py,pz,yaw,vx,vy,vz,vyaw,r)
+  Eigen::Matrix<double, 9, 9> P{};
+  Eigen::Matrix<double, 9, 9> F{};
 
-        // 距上一次真正吃到观测过了多久，丢目标判定用。
-        double time_since_update_ {};
+  bool initialized = false;
 
-        KalmanConfig config {};
+  // 距上一次真正吃到观测过了多久，丢目标判定用。
+  double time_since_update_{};
 
-        std::vector<storedID> id_list {};
-        int max_id {};
+  KalmanConfig config{};
 
-
-        
+  std::vector<storedID> id_list{};
+  int max_id{};
 };
 
+}  // namespace kalfilter
 
-}   // namespace kalfilter
-
-# endif
+#endif
