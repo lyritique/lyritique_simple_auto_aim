@@ -98,7 +98,8 @@ namespace kalfilter
             return J;
         }
 
-        Eigen::Matrix4d computeR(const KalmanConfig& config,const cam_ypd ypd)
+        Eigen::Matrix4d computeR(const KalmanConfig& config,const cam_ypd ypd,
+                                 const Eigen::Matrix3d& R_C0C)
         {
             //预计算
             const double s_e {std::sin(ypd.ele)};
@@ -125,7 +126,15 @@ namespace kalfilter
             Eigen::Matrix<double,4,1> R_ypd(config.azi*config.azi,config.ele*config.ele,
                                     sigma_dist*sigma_dist,config.yaw*config.yaw);
 
-            return  Eigen::Matrix4d   { J * R_ypd.asDiagonal() * J.transpose()};
+            // J 求出来的是相机系的协方差，而 measurement / H / P 都在世界系。
+            // 位置那三行要跟着 R_C0C 转过去，不然深度噪声会被摆到错误的轴上。
+            // yaw 是角度方差，绕竖轴旋转不改变它，第四行保持不动
+            // （这里忽略 roll/pitch 对 yaw 雅可比的影响，属于二阶小量）。
+            Eigen::Matrix4d J_world = J;
+            J_world.topLeftCorner<3, 3>() =
+                R_C0C * J.topLeftCorner<3, 3>();
+
+            return  Eigen::Matrix4d   { J_world * R_ypd.asDiagonal() * J_world.transpose()};
             
         }
 
@@ -319,7 +328,8 @@ namespace kalfilter
     }
 
 
-    void KalmanFilter::update ( armerState& armor  ,const cam_ypd& ypd)
+    void KalmanFilter::update ( armerState& armor  ,const cam_ypd& ypd,
+                                const Eigen::Matrix3d& R_C0C)
     {
         /*
         //h(X_)部分写在匿名命名空间
@@ -347,7 +357,7 @@ namespace kalfilter
         const Eigen::Matrix<double, 9, 9> P_prior = P;
 
         //判断armor的id，顺带算好H，nu（残差）,S^-1
-        Eigen::Matrix4d R {computeR(config, ypd)};
+        Eigen::Matrix4d R {computeR(config, ypd, R_C0C)};
         armor.testResult = associate(armor,id_list,X,P,config,R,max_id);
 
         //检查是否过了匹配

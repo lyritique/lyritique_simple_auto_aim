@@ -73,6 +73,18 @@ public:
         const core::TimestampedFrame& frame,
         const Eigen::Matrix3d& R_C0C);
 
+    // 作用：只做检测，不碰姿态。实现：尺寸检查 + 检测器前向。
+    // 参数：frame —— 带时间戳的 BGR 帧。返回：本帧所有装甲板候选。
+    // 实时链路先调它、再取姿态，把等 IMU 的耗时藏在推理下面。
+    detector::ArmorDetections detect(const core::TimestampedFrame& frame);
+
+    // 作用：拿检测结果做客位姿和滤波。实现：补预测、逐块细化 + PnP、按距离筛选后送 EKF。
+    // 参数：detections —— detect() 的结果；R_C0C —— 相机系到世界系的旋转。
+    FrameProcessingResult solve(
+        const core::TimestampedFrame& frame,
+        const detector::ArmorDetections& detections,
+        const Eigen::Matrix3d& R_C0C);
+
     // 作用：把相机内参借给外面画重投影。实现：直接转发 pnp_ 里的 cv::Mat，不改不拷贝。
     // 参数：无。返回：3x3 内参矩阵的常量引用，生命周期跟本对象走，别存指针。
     const cv::Mat& cameraMatrix() const noexcept

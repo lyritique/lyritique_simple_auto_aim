@@ -43,7 +43,10 @@ int main()
 
     // 重新观测到目标后要能恢复。
     measurement.measurement << 0.0, 0.0, 2.0, 0.0;
-    filter.update(measurement, kalfilter::cam_ypd {0.0, 0.0, 2.0});
+    filter.update(
+        measurement,
+        kalfilter::cam_ypd {0.0, 0.0, 2.0},
+        Eigen::Matrix3d::Identity());
     expect(filter.getOutput().valid, "重新观测后应恢复 valid");
 
     if (failures == 0)

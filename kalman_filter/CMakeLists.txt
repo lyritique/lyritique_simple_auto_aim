@@ -160,5 +160,17 @@ if(BUILD_TESTING)
         NAME kalman_yaw_wrap_test
         COMMAND kalman_yaw_wrap_test
     )
+
+    add_executable(
+        kalman_noise_frame_test
+        tests/kalman_noise_frame_test.cpp
+        src/estimation/kalman_filter.cc
+    )
+    target_include_directories(kalman_noise_frame_test PRIVATE src/)
+    target_link_libraries(kalman_noise_frame_test PRIVATE Eigen3::Eigen)
+    add_test(
+        NAME kalman_noise_frame_test
+        COMMAND kalman_noise_frame_test
+    )
 endif()
 

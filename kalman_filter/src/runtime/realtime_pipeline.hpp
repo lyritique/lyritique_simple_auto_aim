@@ -76,6 +76,8 @@ struct PipelineStats
     uint64_t dropped_frames {};
     // 作用：累计有多少帧产出了有效状态。实现：EKF 已初始化且 state.valid 才自增。
     uint64_t valid_frames {};
+    // 作用：累计有多少帧的姿态是靠外推补的。实现：waitForAttitude 走 predict 分支时自增。
+    uint64_t extrapolated_attitude {};
 };
 
 // 作用：每帧处理完的回调类型，方便外面接 UI、录包或发指令。实现：std::function 包住“原始帧 + 结果”两个参数。

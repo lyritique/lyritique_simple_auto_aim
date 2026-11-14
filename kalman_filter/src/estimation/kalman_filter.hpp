@@ -92,7 +92,9 @@ class KalmanFilter
         void init(armerState& measurement);
         void reset();
         void predict(const double& dt);
-        void update(armerState& armor ,const cam_ypd& ypd);
+        // R_C0C 把观测噪声从相机系转到世界系，必须和 measurement 用同一个旋转。
+        void update(armerState& armor ,const cam_ypd& ypd,
+                    const Eigen::Matrix3d& R_C0C);
         //这个是每一帧的结束处理id_list的
         void renewArmorList ();
         KFResult getOutput() const;
