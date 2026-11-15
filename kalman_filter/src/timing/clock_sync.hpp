@@ -24,7 +24,8 @@ class ClockSync {
   // 作用：把当前延迟借出去给日志或 UI 看。实现：加锁读一份副本，避免看到改到一半的值。
   double commLatency() const;
 
-  // 作用：一次调用干三件事——展开回绕、验单调、算时间偏移。实现：校验后进锁，32 位毫秒戳补成 64 位微秒，再用中位数更新 offset。
+  // 作用：一次调用干三件事——展开回绕、验单调、算时间偏移。实现：校验后进锁，32 位毫秒戳补成 64 位微秒，再用中位数更新
+  // offset。
   bool observeAndMap(float board_stamp_ms, double receive_host_time, uint64_t& unwrapped_board_us,
                      double& event_host_time);
 

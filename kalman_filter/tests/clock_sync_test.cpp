@@ -16,17 +16,16 @@ int main() {
   double host_time = 0.0;
 
   // 第一关：DWT 戳是毫秒，必须按 1000 倍展开成微秒，否则整条时间轴会慢 1000 倍。
-  if (!clock.observeAndMap(267500.0F, 1000.0, board_time, host_time) ||
-      board_time != 267500000ULL || !near(host_time, 999.998)) {
-    std::cerr << "millisecond to microsecond scale failed: board=" << board_time
-              << " host=" << host_time << "\n";
+  if (!clock.observeAndMap(267500.0F, 1000.0, board_time, host_time) || board_time != 267500000ULL ||
+      !near(host_time, 999.998)) {
+    std::cerr << "millisecond to microsecond scale failed: board=" << board_time << " host=" << host_time << "\n";
     return 1;
   }
 
   // 第二关：相邻 1 ms 的两个样本，上位机时间也必须前进 1 ms，不能被压成 1 μs。
   const double first_host_time = host_time;
-  if (!clock.observeAndMap(267501.0F, 1000.001, board_time, host_time) ||
-      board_time != 267501000ULL || !near(host_time - first_host_time, 0.001)) {
+  if (!clock.observeAndMap(267501.0F, 1000.001, board_time, host_time) || board_time != 267501000ULL ||
+      !near(host_time - first_host_time, 0.001)) {
     std::cerr << "1 ms step mapping failed: delta=" << (host_time - first_host_time) << "\n";
     return 2;
   }
@@ -40,10 +39,9 @@ int main() {
   }
   const double before_wrap = host_time;
 
-  if (!wrap_clock.observeAndMap(4.0F, 2000.516, board_time, host_time) ||
-      board_time != 4294967300000ULL || !near(host_time - before_wrap, 0.516)) {
-    std::cerr << "wrap mapping failed: board=" << board_time
-              << " delta=" << (host_time - before_wrap) << "\n";
+  if (!wrap_clock.observeAndMap(4.0F, 2000.516, board_time, host_time) || board_time != 4294967300000ULL ||
+      !near(host_time - before_wrap, 0.516)) {
+    std::cerr << "wrap mapping failed: board=" << board_time << " delta=" << (host_time - before_wrap) << "\n";
     return 4;
   }
 

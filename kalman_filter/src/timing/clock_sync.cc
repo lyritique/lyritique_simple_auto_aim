@@ -38,11 +38,10 @@ double ClockSync::commLatency() const {
 
 // 作用：喂一个板卡时间戳，换回展开后的微秒数和对应的上位机时间。实现：先做输入体检，再展开回绕、验单调、更新
 // offset，四步一条流水线。
-bool ClockSync::observeAndMap(float board_stamp_ms, double receive_host_time,
-                              uint64_t& unwrapped_board_us, double& event_host_time) {
+bool ClockSync::observeAndMap(float board_stamp_ms, double receive_host_time, uint64_t& unwrapped_board_us,
+                              double& event_host_time) {
   // 作用：挡住 NaN、负数时间和无穷大，这些进了计算只会污染 offset。实现：三个 isfinite/大小判断，不合规直接退票。
-  if (!std::isfinite(board_stamp_ms) || board_stamp_ms < 0.0F ||
-      !std::isfinite(receive_host_time)) {
+  if (!std::isfinite(board_stamp_ms) || board_stamp_ms < 0.0F || !std::isfinite(receive_host_time)) {
     return false;
   }
 
@@ -68,15 +67,13 @@ bool ClockSync::observeAndMap(float board_stamp_ms, double receive_host_time,
     wrap_offset_us_ = 0;
   }
   // 作用：检测 32 位计数器是否绕圈了。实现：数值变小且老值减新值超过半圈，说明是回绕不是后退，补偿加一整圈。
-  else if (raw < last_raw_ms_ &&
-           static_cast<std::uint64_t>(last_raw_ms_ - raw) > kHalfUint32Range) {
+  else if (raw<last_raw_ms_&& static_cast<std::uint64_t>(last_raw_ms_ - raw)> kHalfUint32Range) {
     // 一圈是 2^32 格，而这里的账本记的是微秒，所以要和格宽一起换算。
     wrap_offset_us_ += kUint32Range * kMicrosecondsPerTick;
   }
 
   // 作用：把补偿和历史拼成 64 位单调时间。实现：回绕补偿 + 当前 raw 乘格宽，时间轴从此不会倒流 49 天。
-  const std::uint64_t candidate =
-      wrap_offset_us_ + static_cast<std::uint64_t>(raw) * kMicrosecondsPerTick;
+  const std::uint64_t candidate = wrap_offset_us_ + static_cast<std::uint64_t>(raw) * kMicrosecondsPerTick;
 
   // 乱序或重复的 C 板时间戳不能写进单调历史。
   // 作用：拒绝迟到的包，保护历史严格递增。实现：候选值不大于上一个展开值就 return false，说明是重复或乱序。
