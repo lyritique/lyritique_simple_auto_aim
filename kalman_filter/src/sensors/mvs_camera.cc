@@ -478,7 +478,9 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
       // 但仍然算一个实测值打出来，方便和节点值对账。
       const double fitted = var > 0.0 ? cov / var : 0.0;
       const bool fitted_ok = fitted >= 5e-9 && fitted <= 2e-8;
-      if (config_.tick_ns <= 0.0 && !scale_from_node_ && fitted_ok) {
+      // 显式要了长时间窗口说明就是要标定，这时实测值比节点标称值可靠。
+      const bool trust_fit = !scale_from_node_ || calib_seconds_ > 0.0;
+      if (config_.tick_ns <= 0.0 && trust_fit && fitted_ok) {
         clock_scale_ = fitted;
       }
 
@@ -498,8 +500,8 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
       clock_spread_ms_ = 0.0;
       clock_ready_ = true;
       std::clog << "[相机时钟] 校准完成 ns/tick=" << clock_scale_ * 1e9
-                << (scale_from_node_ ? "（节点值）" : "（拟合值）") << " 实测=" << (fitted_ok ? fitted * 1e9 : 0.0)
-                << " 样本=" << n << '\n';
+                << (fitted_ok && clock_scale_ == fitted ? "（实测值）" : "（节点值）")
+                << " 实测=" << (fitted_ok ? fitted * 1e9 : 0.0) << " 样本=" << n << '\n';
       // 校准期间 last_frame_timestamp_ 记的是收帧时刻，换到设备时刻会"倒退"，
       // 不清掉就会被单调性护栏一直钳成 host_time。
       last_frame_timestamp_ = 0.0;

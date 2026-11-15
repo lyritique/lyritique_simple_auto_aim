@@ -1,7 +1,9 @@
 #include "app/mode_runner.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -72,7 +74,9 @@ int runLive(const core::AppConfig& config) {
   std::signal(SIGTERM, requestStop);
 
   // 作用：进主循环，直到有人喊停。实现：把停止标志交给 run，它自己管读帧和退出。
+  const auto run_started = std::chrono::steady_clock::now();
   pipeline->run(stop_requested);
+  const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - run_started).count();
 
   // 作用：收工后把全局指针和信号处理还原，别影响后续代码。实现：指针置空，两个 signal 恢复 SIG_DFL。
   g_stop_requested = nullptr;
@@ -82,7 +86,13 @@ int runLive(const core::AppConfig& config) {
   // 作用：打一份流水账，看看收了多少、丢了多少。实现：取 stats 快照后一次性输出四个计数。
   const auto stats = pipeline->stats();
   std::cout << "实时模式结束: frames=" << stats.processed_frames << " valid=" << stats.valid_frames
-            << " dropped=" << stats.dropped_frames << " feedback=" << stats.received_feedback << '\n';
+            << " dropped=" << stats.dropped_frames << " feedback=" << stats.received_feedback;
+  // 作用：把时长和帧率一起打出来，取帧积压和时钟漂移才分得清。实现：elapsed 大于 0 才做除法。
+  if (elapsed > 0.0) {
+    std::cout << std::fixed << std::setprecision(2) << " 用时=" << elapsed
+              << "s 帧率=" << static_cast<double>(stats.processed_frames) / elapsed << "fps";
+  }
+  std::cout << '\n';
   return 0;
 }
 
