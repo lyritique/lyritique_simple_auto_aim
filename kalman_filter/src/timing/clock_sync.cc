@@ -12,6 +12,8 @@ namespace
 
 // 作用：微秒转秒的口粮。实现：就是 1e-6，免得代码里到处撒魔法数字。
 constexpr double kMicrosecond = 1e-6;
+// 作用：C 板 DWT 一格是多少微秒。实现：实测计数周期是 1 ms（1 kHz），所以一格 1000 μs。
+constexpr std::uint64_t kMicrosecondsPerTick = 1000;
 // 作用：32 位无符号计数的总格数，回绕一次补这么多。实现：1ULL 左移 32 位，注意用 ULL 防止 32 位平台上溢出。
 constexpr std::uint64_t kUint32Range = 1ULL << 32;
 // 作用：半个圈，用来判断“变小”到底是回绕还是后退。实现：1ULL 左移 31 位，差值过半圈就认定是绕圈。
@@ -46,21 +48,21 @@ double ClockSync::commLatency() const
 
 // 作用：喂一个板卡时间戳，换回展开后的微秒数和对应的上位机时间。实现：先做输入体检，再展开回绕、验单调、更新 offset，四步一条流水线。
 bool ClockSync::observeAndMap(
-    float board_stamp_us,
+    float board_stamp_ms,
     double receive_host_time,
     uint64_t& unwrapped_board_us,
     double& event_host_time)
 {
     // 作用：挡住 NaN、负数时间和无穷大，这些进了计算只会污染 offset。实现：三个 isfinite/大小判断，不合规直接退票。
-    if (!std::isfinite(board_stamp_us) ||
-        board_stamp_us < 0.0F ||
+    if (!std::isfinite(board_stamp_ms) ||
+        board_stamp_ms < 0.0F ||
         !std::isfinite(receive_host_time))
     {
         return false;
     }
 
-    // 作用：把浮点戳四舍五入成整数微秒，顺便防止 float 精度带来的半微秒漂移。实现：llround 到 long long。
-    const auto rounded = std::llround(board_stamp_us);
+    // 作用：把浮点戳四舍五入成整数毫秒，顺便防止 float 精度带来的半格漂移。实现：llround 到 long long。
+    const auto rounded = std::llround(board_stamp_ms);
     // 作用：算一个“上界 + 1”，允许恰好等于 2^32 的边界值。实现：把 2^32 转成有符号数，方便和 rounded 比大小。
     const auto max_plus_one =
         static_cast<long long>(kUint32Range);
@@ -83,20 +85,22 @@ bool ClockSync::observeAndMap(
     if (!has_raw_)
     {
         has_raw_ = true;
-        last_raw_us_ = raw;
+        last_raw_ms_ = raw;
         wrap_offset_us_ = 0;
     }
     // 作用：检测 32 位计数器是否绕圈了。实现：数值变小且老值减新值超过半圈，说明是回绕不是后退，补偿加一整圈。
-    else if (raw < last_raw_us_ &&
-             static_cast<std::uint64_t>(last_raw_us_ - raw) >
+    else if (raw < last_raw_ms_ &&
+             static_cast<std::uint64_t>(last_raw_ms_ - raw) >
                  kHalfUint32Range)
     {
-        wrap_offset_us_ += kUint32Range;
+        // 一圈是 2^32 格，而这里的账本记的是微秒，所以要和格宽一起换算。
+        wrap_offset_us_ += kUint32Range * kMicrosecondsPerTick;
     }
 
-    // 作用：把补偿和历史拼成 64 位单调时间。实现：回绕补偿 + 当前 raw，时间轴从此不会倒流 71 分钟。
+    // 作用：把补偿和历史拼成 64 位单调时间。实现：回绕补偿 + 当前 raw 乘格宽，时间轴从此不会倒流 49 天。
     const std::uint64_t candidate =
-        wrap_offset_us_ + static_cast<std::uint64_t>(raw);
+        wrap_offset_us_ +
+        static_cast<std::uint64_t>(raw) * kMicrosecondsPerTick;
 
     // 乱序或重复的 C 板时间戳不能写进单调历史。
     // 作用：拒绝迟到的包，保护历史严格递增。实现：候选值不大于上一个展开值就 return false，说明是重复或乱序。
@@ -104,7 +108,7 @@ bool ClockSync::observeAndMap(
 
     // 作用：确认收货，把候选值登记成新的历史末端。实现：一次写入输出参数、三个成员，原子地完成状态推进。
     unwrapped_board_us = candidate;
-    last_raw_us_ = raw;
+    last_raw_ms_ = raw;
     last_unwrapped_us_ = candidate;
     has_unwrapped_ = true;
 
@@ -151,7 +155,7 @@ void ClockSync::reset()
     std::lock_guard<std::mutex> lock(mutex_);
     has_raw_ = false;
     has_unwrapped_ = false;
-    last_raw_us_ = 0;
+    last_raw_ms_ = 0;
     wrap_offset_us_ = 0;
     last_unwrapped_us_ = 0;
     offsets_.clear();

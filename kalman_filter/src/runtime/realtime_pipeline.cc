@@ -456,7 +456,7 @@ void RealtimePipeline::handleFeedback(
     // 作用：准备接收同步结果：展开后的板卡微秒和对应的上位机时刻。实现：两个局部变量，由 observeAndMap 填。
     uint64_t board_time_us {};
     double event_host_time {};
-    // 作用：同步失败说明戳有问题（乱序、越界），这条反馈不要也罢。实现：返回假直接 return。
+    // 作用：同步失败说明戳有问题（乱序、越界），这条反馈不要也罢。实现：DWT_stamp 是毫秒，ClockSync 按 ms 展开再换成 μs。
     if (!clock_.observeAndMap(
             packet.DWT_stamp,
             receive_time,

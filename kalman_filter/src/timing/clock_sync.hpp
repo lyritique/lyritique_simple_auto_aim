@@ -10,10 +10,10 @@ namespace kalfilter
 {
 
 /*
- * 把 C 板的 DWT 微秒时间映射到上位机 steady_clock 秒。
+ * 把 C 板的 DWT 毫秒时间映射到上位机 steady_clock 秒。
  *
- * DWT_stamp 的浮点数量级可能很大，且 32 位微秒计数约 71.6 分钟回绕一次。
- * observeAndMap() 负责展开回绕；通信延迟只用于修正“时间戳事件 -> 包到达”的偏差。
+ * DWT_stamp 实测是毫秒计数（1 kHz 一格），32 位毫秒约 49.7 天回绕一次。
+ * observeAndMap() 负责展开回绕并换成微秒；通信延迟只用于修正“时间戳事件 -> 包到达”的偏差。
  */
 class ClockSync
 {
@@ -28,9 +28,9 @@ public:
     // 作用：把当前延迟借出去给日志或 UI 看。实现：加锁读一份副本，避免看到改到一半的值。
     double commLatency() const;
 
-    // 作用：一次调用干三件事——展开回绕、验单调、算时间偏移。实现：校验后进锁，32 位戳补成 64 位，再用中位数更新 offset。
+    // 作用：一次调用干三件事——展开回绕、验单调、算时间偏移。实现：校验后进锁，32 位毫秒戳补成 64 位微秒，再用中位数更新 offset。
     bool observeAndMap(
-        float board_stamp_us,
+        float board_stamp_ms,
         double receive_host_time,
         uint64_t& unwrapped_board_us,
         double& event_host_time);
@@ -62,9 +62,9 @@ private:
     bool has_raw_ {};
     // 作用：记号笔，记着“有没有展开后的时间”。实现：bool 开关，给单调性检查当门禁。
     bool has_unwrapped_ {};
-    // 作用：上一个 32 位原始微秒值，用来判断这次是不是跨过回绕点。实现：直接存上一次 raw，新老一比就知道。
-    std::uint32_t last_raw_us_ {};
-    // 作用：累计回绕补偿，跨一次圈就加 2^32 微秒。实现：64 位累加器，只增不减，时间因此单调向前。
+    // 作用：上一个 32 位原始毫秒值，用来判断这次是不是跨过回绕点。实现：直接存上一次 raw，新老一比就知道。
+    std::uint32_t last_raw_ms_ {};
+    // 作用：累计回绕补偿，跨一次圈就加 2^32 毫秒。实现：64 位微秒累加器，只增不减，时间因此单调向前。
     std::uint64_t wrap_offset_us_ {};
     // 作用：上一个展开后的时间戳，充当交通警察。实现：64 位保存，新候选值必须严格更大才放行。
     std::uint64_t last_unwrapped_us_ {};

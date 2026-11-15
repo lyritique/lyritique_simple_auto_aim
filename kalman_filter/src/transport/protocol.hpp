@@ -11,7 +11,7 @@ namespace comm {
 struct __attribute__((packed)) GimbalToVision
 {
 uint8_t head [2];   // 5A 01
-float DWT_stamp;    // DWT 时间，源码标注单位 μS
+float DWT_stamp;    // DWT 时间，实测单位 ms（1 kHz 一格），不是 μs
 
 uint8_t mode;
 float q[4];   //四元数，w、x、y、2
