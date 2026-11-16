@@ -58,6 +58,9 @@ class MvsCamera final : public CameraSource {
   // 设备时钟 -> 主机单调钟：读节点配对采样，求钟差。
   bool calibrateDeviceClock(std::string* error);
   bool readDeviceTimestamp(uint64_t& ticks, std::string* error) const;
+  // 先发锁存命令再读。这台 U3V 相机不锁存时 DeviceTimestamp 恒返回 0，
+  // 而且不报错，节点名是 DeviceTimestampLatch（不是 TimestampLatch）。
+  bool latchDeviceTimestamp(uint64_t& ticks);
   double deviceTicksToHost(uint64_t ticks) const;
 
   // 尽力打开 Chunk-Exposure；失败只警告，不影响取流。

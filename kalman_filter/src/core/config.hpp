@@ -49,7 +49,9 @@ struct CameraConfig {
   // 台架测出的常数偏差，正值表示把帧时间往后挪（µs）。
   double timestamp_offset_us{0.0};
   // 设备戳落在曝光区间的比例：0=曝光开始，0.5=中点，1=结束。
-  float exposure_anchor{0.5F};
+  // 这台相机的 nDevTimeStamp 锁存在曝光起点，所以填 0；代码会把帧时间
+  // 补到曝光中点（加半个曝光），代表"这一帧看到的世界"对应的时刻。
+  float exposure_anchor{0.0F};
   // 尝试开启 Chunk-Exposure 拿每帧曝光时间；不支持就自动退回。
   bool chunk_exposure{true};
   // 打印时钟校准结果和每帧时间戳，台架实验用。

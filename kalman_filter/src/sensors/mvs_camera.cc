@@ -611,6 +611,13 @@ void MvsCamera::close() {
   last_frame_timestamp_ = 0.0;
 }
 
+bool MvsCamera::latchDeviceTimestamp(uint64_t& ticks) {
+  // 这台 U3V 相机不锁存时 DeviceTimestamp 恒返回 0，而且不报错；
+  // 锁存命令是 DeviceTimestampLatch（TimestampLatch 节点不存在，返回 0x80000109）。
+  if (MV_CC_SetCommandValue(handle_, "DeviceTimestampLatch") != MV_OK) return false;
+  return readDeviceTimestamp(ticks, nullptr);
+}
+
 bool MvsCamera::readDeviceTimestamp(uint64_t& ticks, std::string* error) const {
   MVCC_INTVALUE_EX value{};
   const int ret = MV_CC_GetIntValueEx(handle_, "DeviceTimestamp", &value);
@@ -651,70 +658,66 @@ bool MvsCamera::calibrateDeviceClock(std::string* error) {
     }
   }
 
-  // 只在读节点的瞬间配对，不掺入图像传输延迟，否则等于没换。
-  // 有些型号的 DeviceTimestamp 是按帧更新的，采样窗口必须跨过几个帧周期，
-  // 否则连续读到同一个值会被误判成"没走动"。
-  constexpr int kSamples = 24;
-  constexpr double kMaxWaitSeconds = 1.0;
+  // 采样分两步：先试直读；直读拿不到走动值，就发 DeviceTimestampLatch 再读。
+  // 直读模式下计数器在两次读数之间取值，用中点；锁存模式下锁存发生在命令
+  // 发出那一刻，用 before 当下界，多次取最小值逼近真实时刻。
+  constexpr int kSamples = 20;
+  if (error) error->clear();
+
+  const auto collect = [&](bool use_latch, std::vector<double>& offsets) {
+    int moved = 0;
+    uint64_t prev = 0;
+    for (int i = 0; i < kSamples; ++i) {
+      const double before = steadyNowSeconds();
+      uint64_t ticks = 0;
+      const bool ok = use_latch ? latchDeviceTimestamp(ticks) : readDeviceTimestamp(ticks, nullptr);
+      const double after = steadyNowSeconds();
+      if (ok && ticks != 0) {
+        if (i > 0 && ticks != prev) ++moved;
+        prev = ticks;
+        const double host = use_latch ? before : (before + after) * 0.5;
+        offsets.push_back(host - static_cast<double>(ticks) * clock_scale_);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return moved;
+  };
+
   std::vector<double> offsets;
   offsets.reserve(kSamples);
-  uint64_t first_ticks = 0;
-  uint64_t last_ticks = 0;
-  int taken = 0;
-  int changes = 0;
 
-  const double deadline = steadyNowSeconds() + kMaxWaitSeconds;
-  for (;;) {
-    // 够样本且值已经走动就收工；等满一秒还没动就认输。
-    if (taken >= kSamples && last_ticks > first_ticks) break;
-    if (steadyNowSeconds() > deadline) break;
-
-    const double before = steadyNowSeconds();
-    uint64_t ticks = 0;
-    std::string read_error;
-    if (!readDeviceTimestamp(ticks, &read_error)) {
-      if (error) *error = read_error;
-      return false;
+  int moved = collect(false, offsets);
+  bool via_latch = false;
+  if (moved < 3) {
+    // 恒 0 或者不随帧走动：这台相机必须先锁存，DeviceTimestamp 才有值。
+    offsets.clear();
+    const int latched_moved = collect(true, offsets);
+    if (latched_moved >= 3) {
+      via_latch = true;
+      moved = latched_moved;
     }
-    const double after = steadyNowSeconds();
-
-    if (taken == 0)
-      first_ticks = ticks;
-    else if (ticks != last_ticks)
-      ++changes;
-    last_ticks = ticks;
-    ++taken;
-
-    offsets.push_back((before + after) * 0.5 - static_cast<double>(ticks) * clock_scale_);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
 
-  if (offsets.empty()) {
-    if (error) *error = "DeviceTimestamp 采样为空";
-    return false;
-  }
-
-  if (last_ticks <= first_ticks) {
-    // 节点恒为 0，或者只在出帧时跳一次，都走这里。
-    // 这种型号的戳在帧信息里是好的，改用真实帧做在线校准。
+  if (offsets.size() < 3) {
+    // 两种都读不出走动值：该型号的戳只在帧信息里可靠，改用真实帧校准。
     calib_frames_left_ = kFrameCalibFrames;
     return true;
   }
 
   std::sort(offsets.begin(), offsets.end());
 
-  // 自由计数器每次读都在变，抖动只是噪声，取中位数最稳；
-  // 按帧更新的节点（值只在帧到达时跳一次）会让 offset 呈锯齿，
-  // 取最小值才对应"戳刚更新"那一刻，不会带上半个帧周期的偏差。
-  const bool free_running = changes * 2 >= taken;
-  if (free_running) {
+  // 锁存样本取最小值（延迟下界最接近真实锁存时刻）；
+  // 自由计数器直读的抖动是零均值噪声，取中位数更稳。
+  if (via_latch || moved * 2 < static_cast<int>(offsets.size())) {
+    clock_offset_ = offsets.front();
+  } else {
     const std::size_t mid = offsets.size() / 2;
     clock_offset_ = offsets.size() % 2 == 0 ? (offsets[mid - 1] + offsets[mid]) * 0.5 : offsets[mid];
-  } else {
-    clock_offset_ = offsets.front();
   }
   clock_spread_ms_ = (offsets.back() - offsets.front()) * 1000.0;
   clock_ready_ = true;
+  std::clog << "[相机时钟] 节点对齐 ns/tick=" << clock_scale_ * 1e9 << (via_latch ? "（锁存）" : "（直读）")
+            << " 样本=" << offsets.size() << " 抖动=" << clock_spread_ms_ << "ms\n";
   return true;
 }
 

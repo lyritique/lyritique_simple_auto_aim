@@ -569,7 +569,7 @@ void printUsage(std::ostream& out) {
          "  --gain G              设置增益，负数表示不修改\n"
          "  --camera-time-source S  host 或 device，默认 device\n"
          "  --camera-time-offset-us US  帧时间常数偏移，台架标定用\n"
-         "  --camera-exposure-anchor R  设备戳在曝光区间的比例，0~1，默认 0.5\n"
+         "  --camera-exposure-anchor R  设备戳在曝光区间的比例，0~1，默认 0（曝光起点）\n"
          "  --no-chunk-exposure   关闭 Chunk-Exposure，不读每帧曝光\n"
          "  --camera-timing-log   打印时钟校准结果和每帧时间戳\n"
          "  --camera-calib-seconds S  设备时钟校准窗口，标定 ns/tick 时给几百秒\n"
