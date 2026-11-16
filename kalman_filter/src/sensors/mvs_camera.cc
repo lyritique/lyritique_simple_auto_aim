@@ -499,9 +499,14 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
       clock_offset_ = best;
       clock_spread_ms_ = 0.0;
       clock_ready_ = true;
+      // ns/tick 默认就是固定值。收帧时刻估出来的斜率只做参考，
+      // 它受取帧积压影响能偏到 8%，打出来容易误导人，只在显式要标定时才显示。
       std::clog << "[相机时钟] 校准完成 ns/tick=" << clock_scale_ * 1e9
-                << (fitted_ok && clock_scale_ == fitted ? "（实测值）" : "（节点值）")
-                << " 实测=" << (fitted_ok ? fitted * 1e9 : 0.0) << " 样本=" << n << '\n';
+                << (config_.tick_ns > 0.0 ? "（固定值）" : "（拟合值）") << " 样本=" << n;
+      if (calib_seconds_ > 0.0 && fitted_ok) {
+        std::clog << " 参考:收帧估=" << fitted * 1e9 << "（含积压，仅供参考）";
+      }
+      std::clog << '\n';
       // 校准期间 last_frame_timestamp_ 记的是收帧时刻，换到设备时刻会"倒退"，
       // 不清掉就会被单调性护栏一直钳成 host_time。
       last_frame_timestamp_ = 0.0;
