@@ -189,6 +189,15 @@ FrameProcessingResult FrameProcessor::solve(const core::TimestampedFrame& frame,
     ekf_.renewArmorList();
     result.state = ekf_.getOutput();
     result.state_valid = result.state.valid;
+
+    // 作用：丢目标超时后整体复位，等下一帧重新初始化。
+    // 实现：状态不可信就 reset 并清掉时间记忆；否则它会一直外推，
+    // 状态越飘越远，关联门限再也匹配不上，检测到也接不回来。
+    if (!result.state_valid) {
+      ekf_.reset();
+      ekf_initialized_ = false;
+      has_last_frame_time_ = false;
+    }
   }
 
   // 作用：每 50 帧打一次分段平均，判断该砍推理还是砍后处理。实现：累加后打印并清零。

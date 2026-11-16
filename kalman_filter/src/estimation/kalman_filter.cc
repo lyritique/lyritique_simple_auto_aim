@@ -7,9 +7,9 @@
 #include <iostream>
 
 /*
-EKF追踪X=(px,py,pz,yaw,vx,vy,vz,vyaw,r)
+EKF追踪X=(px,py,pz,yaw,vx,vy,vz,vyaw,r,Δr,Δz)
 predict X_=f(X),P_=F*P*F^T+Q ,F=f(X)一阶导
-新息    h(X_,id)从八维变为四维装甲板数据，y=z-h(X_)，S=H*P_*H^T+R，H=h(X_)一阶导
+新息    h(X_,id)从十一维变为四维装甲板数据，y=z-h(X_)，S=H*P_*H^T+R，H=h(X_)一阶导
 update  增益K=P*H^T*S^-1，  △X=K*y，  X^+=X_+△X
 */
 
@@ -24,39 +24,49 @@ double wrap(double a) {
   return a;
 }
 
-// h(X_),是九维列向量转换为四维列向量，从描述中心到描述装甲板
-Eigen::Matrix<double, 4, 1> observationModel(const Eigen::Matrix<double, 9, 1>& X_, int id) {
+// h(X_),是十一维列向量转换为四维列向量，从描述中心到描述装甲板
+Eigen::Matrix<double, 4, 1> observationModel(const Eigen::Matrix<double, 11, 1>& X_, int id) {
   constexpr double kPi = 3.14159265358979323846;
   const double theta = X_(3) + id * kPi * 0.5;
   const double s = std::sin(theta);
   const double c = std::cos(theta);
-  const double r = X_(8);
+
+  // 两对装甲板并不同圆同高：偶数对（0/2）作为基准，奇数对（1/3）各自差 Δr、Δz。
+  // 不加这两项时，这部分结构性偏差会被滤波器当成车心在动，旋转时位置就跟着抖。
+  const bool paired = (id % 2) == 1;
+  const double r = X_(8) + (paired ? X_(9) : 0.0);
+  const double height = X_(1) + (paired ? X_(10) : 0.0);
 
   Eigen::Matrix<double, 4, 1> y;
-  y << X_(0) + r * s, X_(1), X_(2) + r * c, theta;
+  y << X_(0) + r * s, height, X_(2) + r * c, theta;
 
   return y;
 }
 
 // 计算新息雅克布矩阵H
-Eigen::Matrix<double, 4, 9> computeH(const Eigen::Matrix<double, 9, 1>& X_, int id) {
+Eigen::Matrix<double, 4, 11> computeH(const Eigen::Matrix<double, 11, 1>& X_, int id) {
   const double c = id * kPI * 0.5;
   const double theta = X_(3) + c;
   const double s = std::sin(theta);
   const double co = std::cos(theta);
-  const double r = X_(8);
 
-  Eigen::Matrix<double, 4, 9> J{Eigen::Matrix<double, 4, 9>::Zero()};
+  const bool paired = (id % 2) == 1;
+  const double r = X_(8) + (paired ? X_(9) : 0.0);
+
+  Eigen::Matrix<double, 4, 11> J{Eigen::Matrix<double, 4, 11>::Zero()};
 
   J(0, 0) = 1.0;
   J(0, 3) = r * co;
   J(0, 8) = s;
+  J(0, 9) = paired ? s : 0.0;  // ∂x/∂Δr
 
   J(1, 1) = 1.0;
+  J(1, 10) = paired ? 1.0 : 0.0;  // ∂y/∂Δz
 
   J(2, 2) = 1.0;
   J(2, 3) = -r * s;
   J(2, 8) = co;
+  J(2, 9) = paired ? co : 0.0;  // ∂z/∂Δr
 
   J(3, 3) = 1.0;
 
@@ -99,12 +109,12 @@ Eigen::Matrix4d computeR(const KalmanConfig& config, const cam_ypd ypd, const Ei
   return Eigen::Matrix4d{J_world * R_ypd.asDiagonal() * J_world.transpose()};
 }
 
-ObsAssociation associate(const armerState& armor, std::vector<storedID>& id_list, const Eigen::Matrix<double, 9, 1>& X,
-                         const Eigen::Matrix<double, 9, 9>& P, const KalmanConfig& config, const Eigen::Matrix4d& R,
+ObsAssociation associate(const armerState& armor, std::vector<storedID>& id_list, const Eigen::Matrix<double, 11, 1>& X,
+                         const Eigen::Matrix<double, 11, 11>& P, const KalmanConfig& config, const Eigen::Matrix4d& R,
                          int& max_id) {
   Eigen::Matrix<double, 4, 1> h_id{};
   Eigen::Matrix<double, 4, 1> nu{};
-  Eigen::Matrix<double, 4, 9> H_id{};
+  Eigen::Matrix<double, 4, 11> H_id{};
   Eigen::Matrix4d Sinv_id{};
   double d2{};
 
@@ -189,6 +199,9 @@ void KalmanFilter::init(armerState& measurement) {
   constexpr double radius = 0.254;
   X.setZero();
   X(8) = radius;  // 魔法数字
+  // 首帧这块板被当成 id 0（偶数对），所以 Δ 只给先验，等另一对露脸再由观测修正。
+  X(9) = config.init_dr;
+  X(10) = config.init_dz;
   const double c = measurement.testResult.id * kPI * 0.5;
   X(1) = measurement.measurement(1);  // 高度/该轴直接对应
   X(3) = measurement.measurement(3);  // 旋转角，中心yaw零对应首个数据
@@ -211,6 +224,8 @@ void KalmanFilter::init(armerState& measurement) {
   P(6, 6) = sv;
   P(7, 7) = sw;
   P(8, 8) = config.kRadiusSigma * config.kRadiusSigma;
+  P(9, 9) = config.init_sigma_dr * config.init_sigma_dr;
+  P(10, 10) = config.init_sigma_dz * config.init_sigma_dz;
   initialized = true;
   time_since_update_ = 0.0;
 }
@@ -236,11 +251,12 @@ void KalmanFilter::predict(const double& dt) {
 
   // 计算雅克布矩阵
   // 让它特定位置的4*4块变成单位乘dt，就是根据dt更新了
+  // 第 9、10 行保持 F 对角为 1：Δr/Δz 是车体结构尺寸，不随 dt 演化。
   F.template block<4, 4>(0, 4) = dt * Eigen::Matrix4d::Identity();
 
   // 分段白噪声模型制造Q
   // 模型中目标的加速度是一个分段常数，在每一段内以为白噪声形式随机变化
-  Eigen::Matrix<double, 9, 9> Q{Eigen::Matrix<double, 9, 9>::Zero()};
+  Eigen::Matrix<double, 11, 11> Q{Eigen::Matrix<double, 11, 11>::Zero()};
   const double dt2 = dt * dt;
   const double dt3 = dt2 * dt;
   const double dt4 = dt2 * dt2;
@@ -257,6 +273,8 @@ void KalmanFilter::predict(const double& dt) {
   fill_block(2, 6, config.p_coord);
   fill_block(3, 7, config.p_yaw);
   Q(8, 8) = config.p_r * dt;
+  Q(9, 9) = config.p_dr * dt;
+  Q(10, 10) = config.p_dz * dt;
 
   P = F * P * F.transpose() + Q;
 
@@ -289,8 +307,8 @@ void KalmanFilter::update(armerState& armor, const cam_ypd& ypd, const Eigen::Ma
   if (!initialized) return;
 
   // 保存先验
-  const Eigen::Matrix<double, 9, 1> x_prior = X;
-  const Eigen::Matrix<double, 9, 9> P_prior = P;
+  const Eigen::Matrix<double, 11, 1> x_prior = X;
+  const Eigen::Matrix<double, 11, 11> P_prior = P;
 
   // 判断armor的id，顺带算好H，nu（残差）,S^-1
   Eigen::Matrix4d R{computeR(config, ypd, R_C0C)};
@@ -300,13 +318,13 @@ void KalmanFilter::update(armerState& armor, const cam_ypd& ypd, const Eigen::Ma
   if (!armor.testResult.valid) return;
 
   // 保存先验，写迭代
-  Eigen::Matrix<double, 9, 1> x_iter = x_prior;
+  Eigen::Matrix<double, 11, 1> x_iter = x_prior;
 
   constexpr int max_iterations = 5;
 
   for (int iteration = 0; iteration < max_iterations; ++iteration) {
     // 1. 在 x_iter 处重新线性化
-    const Eigen::Matrix<double, 4, 9> H = computeH(x_iter, armor.testResult.id);
+    const Eigen::Matrix<double, 4, 11> H = computeH(x_iter, armor.testResult.id);
 
     // 2. 新息协方差
     const Eigen::Matrix4d S{H * P_prior * H.transpose() + R};
@@ -314,14 +332,14 @@ void KalmanFilter::update(armerState& armor, const cam_ypd& ypd, const Eigen::Ma
     const Eigen::Matrix4d S_inv{S.ldlt().solve(Eigen::Matrix4d::Identity())};
 
     // 3. 增益
-    const Eigen::Matrix<double, 9, 4> K{P_prior * H.transpose() * S_inv};
+    const Eigen::Matrix<double, 11, 4> K{P_prior * H.transpose() * S_inv};
 
     // 4. 当前迭代点与观测的差
     Eigen::Matrix<double, 4, 1> residual = armor.measurement - observationModel(x_iter, armor.testResult.id);
     residual(3) = wrap(residual(3));
 
     // 5. 当前状态相对先验移动了多少
-    Eigen::Matrix<double, 9, 1> delta = x_iter - x_prior;
+    Eigen::Matrix<double, 11, 1> delta = x_iter - x_prior;
 
     // yaw 分量同样需要环绕
     delta(3) = wrap(delta(3));
@@ -331,16 +349,17 @@ void KalmanFilter::update(armerState& armor, const cam_ypd& ypd, const Eigen::Ma
     residual(3) = wrap(residual(3));
 
     // 7. 从x_prior出发
-    Eigen::Matrix<double, 9, 1> x_next = x_prior + K * residual;
+    Eigen::Matrix<double, 11, 1> x_next = x_prior + K * residual;
 
     // 8. 判断是否收敛
-    Eigen::Matrix<double, 9, 1> step = x_next - x_iter;
+    Eigen::Matrix<double, 11, 1> step = x_next - x_iter;
     step(3) = wrap(step(3));
     x_iter = x_next;
 
     // 每一项都要很小
     const bool converged = step.head<3>().norm() < 1e-4 && std::abs(step(3)) < 1e-4 &&
-                           step.segment<3>(4).norm() < 1e-3 && std::abs(step(7)) < 1e-3 && std::abs(step(8)) < 1e-4;
+                           step.segment<3>(4).norm() < 1e-3 && std::abs(step(7)) < 1e-3 && std::abs(step(8)) < 1e-4 &&
+                           std::abs(step(9)) < 1e-5 && std::abs(step(10)) < 1e-5;
 
     if (converged) break;
   }
@@ -359,15 +378,15 @@ void KalmanFilter::update(armerState& armor, const cam_ypd& ypd, const Eigen::Ma
   // 迭代更新后可能又被推出 ±π，收尾再折一次。
   X(3) = wrap(X(3));
 
-  const Eigen::Matrix<double, 4, 9> H_final = computeH(X, armor.testResult.id);
+  const Eigen::Matrix<double, 4, 11> H_final = computeH(X, armor.testResult.id);
 
   const Eigen::Matrix4d S_final = H_final * P_prior * H_final.transpose() + R;
 
   const Eigen::Matrix4d S_inv_final = S_final.ldlt().solve(Eigen::Matrix4d::Identity());
 
-  const Eigen::Matrix<double, 9, 4> K_final = P_prior * H_final.transpose() * S_inv_final;
+  const Eigen::Matrix<double, 11, 4> K_final = P_prior * H_final.transpose() * S_inv_final;
 
-  const Eigen::Matrix<double, 9, 9> IKH = Eigen::Matrix<double, 9, 9>::Identity() - K_final * H_final;
+  const Eigen::Matrix<double, 11, 11> IKH = Eigen::Matrix<double, 11, 11>::Identity() - K_final * H_final;
 
   P = IKH * P_prior * IKH.transpose() + K_final * R * K_final.transpose();
 
