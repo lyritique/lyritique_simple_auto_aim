@@ -567,7 +567,7 @@ void printUsage(std::ostream& out) {
          "  --exposure-us US      设置曝光时间，0 表示不修改\n"
          "  --exposure-preset P   dark / indoor / bright，一次配好曝光+增益+帧率\n"
          "  --gain G              设置增益，负数表示不修改\n"
-         "  --camera-time-source S  host 或 device，默认 host（设备戳要求帧率跑满）\n"
+         "  --camera-time-source S  host 或 device，默认 device\n"
          "  --camera-time-offset-us US  帧时间常数偏移，台架标定用\n"
          "  --camera-exposure-anchor R  设备戳在曝光区间的比例，0~1，默认 0.5\n"
          "  --no-chunk-exposure   关闭 Chunk-Exposure，不读每帧曝光\n"

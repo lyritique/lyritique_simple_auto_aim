@@ -42,11 +42,10 @@ struct CameraConfig {
   float gain{-1.0F};
 
   // 时间戳策略：把相机设备时钟映射到主机单调钟。
-  // 默认关：这台相机的设备戳按「设定帧率」计数，实际帧率一旦达不到设定值
-  // （25 ms 曝光 + 读出开销 ≈ 40 ms，只能跑 24.9 fps），戳就会以每秒几毫秒的速度落后，
-  // 跑一分钟偏几秒。收帧时刻自带 1~2 ms 抖动但没有系统偏差，更稳妥。
-  // 想要低抖动、且确认相机能跑满设定帧率时，再开 --camera-time-source device。
-  bool use_device_timestamp{false};
+  // 默认开：nDevTimeStamp 是 100 MHz 自由计数器（实测 100.0186 MHz，停流也在跑），
+  // 帧间隔直接用它差分即可，抖动在 ns 级。
+  // 注意 DeviceTimestamp 节点需要先发 DeviceTimestampLatch 才会返回非零。
+  bool use_device_timestamp{true};
   // 台架测出的常数偏差，正值表示把帧时间往后挪（µs）。
   double timestamp_offset_us{0.0};
   // 设备戳落在曝光区间的比例：0=曝光开始，0.5=中点，1=结束。
