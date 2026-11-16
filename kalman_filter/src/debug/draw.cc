@@ -68,12 +68,12 @@ void drawDetections(cv::Mat& frame, const detector::ArmorDetections& detections)
 
 // 右上角ekf信息
 void drawStateText(cv::Mat& frame, const kalfilter::KFResult& state) {
-  // 准备5行文字
-  std::array<std::string, 5> lines;
+  // 准备6行文字
+  std::array<std::string, 6> lines;
 
   if (!state.valid) {
-    lines = {"EKF: not initialized", "", "", "", ""};
-  } else  // 输入九维状态
+    lines = {"EKF: not initialized", "", "", "", "", ""};
+  } else  // 输入十一维状态
   {
     std::ostringstream position;
     position << std::fixed << std::setprecision(2) << "pos: " << state.state(0) << ", " << state.state(1) << ", "
@@ -92,7 +92,11 @@ void drawStateText(cv::Mat& frame, const kalfilter::KFResult& state) {
     std::ostringstream radius;
     radius << std::fixed << std::setprecision(3) << "r: " << state.state(8);
 
-    lines = {position.str(), velocity.str(), yaw.str(), yaw_rate.str(), radius.str()};
+    // 两对装甲板的结构差异，收敛后应该基本不动。
+    std::ostringstream offset;
+    offset << std::fixed << std::setprecision(3) << "dr: " << state.state(9) << ", dz: " << state.state(10);
+
+    lines = {position.str(), velocity.str(), yaw.str(), yaw_rate.str(), radius.str(), offset.str()};
   }
 
   constexpr int line_height{22};
@@ -156,21 +160,16 @@ void drawFourArmorReprojections(cv::Mat& frame, const kalfilter::KFResult& state
   };
 
   for (int armor_id = 0; armor_id < 4; ++armor_id) {
-    // const double theta = wrap(
-    //     chassis_yaw + armor_id * kPi * 0.5);
-
     const double theta = chassis_yaw + armor_id * kPi * 0.5;
 
-    const double center_x = px + radius * std::sin(theta);
+    // 和 EKF 观测模型完全一致的板中心：奇数对（1/3）带着 Δr、Δz。
+    // 画图不跟这个，重投影就会和滤波器假设错开，验证也就没意义了。
+    const bool paired = (armor_id % 2) == 1;
+    const double radius_eff = radius + (paired ? state.state(9) : 0.0);
 
-    const double center_z = pz + radius * std::cos(theta);
-
-    // 与 EKF 观测模型的板中心公式一致
-    // const double center_x =
-    //    px + radius * std::sin(theta);
-    const double center_y = py;
-    // const double center_z =
-    //     pz + radius * std::cos(theta);
+    const double center_x = px + radius_eff * std::sin(theta);
+    const double center_z = pz + radius_eff * std::cos(theta);
+    const double center_y = py + (paired ? state.state(10) : 0.0);
 
     const double s = std::sin(theta);
     const double c = std::cos(theta);

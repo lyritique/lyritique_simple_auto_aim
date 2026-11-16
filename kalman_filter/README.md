@@ -1,6 +1,6 @@
 # auto_aim / kalman_filter
 
-基于 YOLO、PnP 和 9 维 EKF 的装甲板状态估计程序。
+基于 YOLO、PnP 和 11 维 EKF 的装甲板状态估计程序。
 
 支持两种运行方式：
 
@@ -31,7 +31,7 @@ src/
 ├── app/          命令行、模式分发
 ├── core/         统一配置、带时间戳帧
 ├── vision/       检测、装甲板几何、PnP
-├── estimation/   9 维 EKF
+├── estimation/   11 维 EKF
 ├── runtime/      共享处理器、实时/回放 Pipeline
 ├── sensors/      相机接口、MVS 相机、AVI 视频源
 ├── timing/       时钟同步、姿态历史、延迟统计、离线 IMU
@@ -117,7 +117,7 @@ TensorRT 首次运行需要构建 engine，会在 `model/trt_cache` 下生成缓
 | 文件 | 内容 |
 |---|---|
 | `output/output_video.avi` | 检测框、角点和 EKF 状态叠加 |
-| `output/data.csv` | 时间、9 维状态和本帧重投影误差 |
+| `output/data.csv` | 时间、11 维状态和本帧重投影误差 |
 
 CSV 的历史格式保留下来，因此数据行末尾可能追加数量不固定的重投影误差列。
 
@@ -128,7 +128,7 @@ CSV 的历史格式保留下来，因此数据行末尾可能追加数量不固�
   --camera-index 0 \
   --camera-width 1440 \
   --camera-height 1080 \
-  --serial /dev/ttyUSB0 \
+  --serial /dev/ttyACM0 \
   --baud 115200
 ```
 
@@ -158,7 +158,62 @@ CSV 的历史格式保留下来，因此数据行末尾可能追加数量不固�
 
 按 `Ctrl+C` 安全停止。
 
-当前实时模式只接收数据并估计状态，不会自动生成或发送云台控制指令。`RealtimePipeline::send()` 已预留，后续应在弹道、延迟和安全门限完成后接入。
+### 云台指令
+
+默认只算不发。`--aim-debug` 每 0.5 s 打一行，把解出来的指令和 C 板自报的姿态并排打出来；
+确认过坐标系再用 `--send-control` 真正写串口。
+
+| 参数 | 含义 |
+|---|---|
+| `--aim-debug` | 打印解算指令 + C 板自报 yaw/pitch，判断坐标系约定 |
+| `--send-control` | 真正把 `VisionToGimbal` 写进串口 |
+| `--bullet-speed F` | C 板没报弹速时的兜底值，m/s |
+| `--command-mode N` | 指令里的 `mode` 字节，含义由 C 板定义，默认 0 |
+| `--up-axis y\|z` | C 板世界系哪根轴朝天，默认 `z`（`yaw=atan2(y,x)`、`pitch=asin(z)`） |
+| `--yaw-sign F` | yaw 正方向，反了传 `-1` |
+| `--pitch-sign F` | pitch 正方向，`1` 为抬头为正，`-1` 取反 |
+| `--no-cam-remap` | 关闭相机系 → C 板体轴换轴，排查坐标系时用 |
+
+解算流程（`src/control/aim_solver.cpp`）：
+
+1. 按 `处理延迟 + 通信延迟 + 飞行时间` 把 EKF 状态外推到命中时刻，飞行时间和距离互相耦合，迭代两次；
+2. 在预测时刻挑出正对相机的那块装甲板，取板心作为瞄准点（半径按奇偶 id 叠加 Δr、Δz）；
+3. 换轴并转回 C 板世界系。
+
+第 3 步是重点。C 板的四元数描述的是它的 IMU 体轴（x 前、y 左、z 上），实测它的 `yaw`/`pitch`
+正是体轴 +x 的方位角/仰角（两种姿态都对到 0.01°）；而 EKF 的观测向量在相机系里（x 右、y 下、z 前）。
+两者差一个 90°，所以出口要按 `q_now · M · p_cam` 走：
+
+```text
+p_cam = q_now⁻¹ · q_init · p_C0      // C0 退回当前相机系
+d     = q_now · M · p_cam            // 换轴后转到世界系，M 见 aim_solver.cc
+yaw   = atan2(d.y, d.x)
+pitch = asin(d.z)
+```
+
+C0 是"首帧相机系"，相机耷拉着时它也跟着歪，而 `q_init`/`q_now` 的复合正好把这个耷拉角抵消掉。
+所以发出去的是**绝对世界角**：开机时相机耷拉 20°，pitch 就会是 -20° 附近，而不是 0。
+自检办法：目标在画面正中时，`cmd yaw/pitch` 应该和 `board yaw/pitch` 基本相等。
+
+首次实测建议：
+
+```bash
+./build/kalman_filter --live --aim-debug ...          # 只看不发
+```
+
+对照 `[aim]` 那一行：`board pitch` 应该和"y 朝天"或"z 朝天"其中一组建模对得上。
+如果 `board pitch` 和 `asin(z)` 一致而和 `asin(y)` 对不上，就加 `--up-axis z`；
+如果数值一致但符号相反，就加 `--pitch-sign -1`。对好之后再加 `--send-control`。
+
+离线验证可以用回放：
+
+```bash
+./build/kalman_filter --replay --video ... --imu ... --aim-debug
+```
+
+回放会每 0.5 s 打一行 `[aim]`，用来看角度跟不跟得上；回放不发任何数据。
+
+弹道下坠补偿（`compensate_drop`）目前没有接进 CLI，默认关闭，等弹道模型标定后再开。
 
 ## 坐标系与时间
 
@@ -206,7 +261,10 @@ yaw = atan2(n_C0.x, n_C0.z)
 - C 板反馈中的 `DWT_stamp` 当前按 32 位微秒、可回绕处理。
 - 相机杆臂和真实安装外参尚未建模；当前假设 C 板给出的 `q` 已经完成相机姿态换算。
 - `total_delay = process_latency + comm_latency + fly_time` 的统计框架已具备，但通信延迟和飞行时间仍需现场测量或由弹道模块提供。
-- 实时模式不会自动发送控制指令，避免在时间同步和弹道未验证时产生危险动作。
+- 控制指令默认只算不发；`--send-control` 打开前请先用 `--aim-debug` 核对坐标系约定和角度符号。
+- C 板世界系的竖轴方向（`--up-axis`）和 pitch 正方向（`--pitch-sign`）尚未实测确认，默认按"y 朝天、抬头为正"。
+- 指令里的 `time_stamp` 是该指令的生成时刻，换算到 C 板时钟、单位毫秒（与 `DWT_stamp` 一致）。C 板若按其它单位解析需要再对一次。
+- 相机杆臂（相机光心与云台旋转中心的偏移）尚未建模，近距离大角度时会有误差。
 
 ## 测试
 
@@ -217,6 +275,8 @@ CTest 覆盖：
 - DWT 时间回绕与时钟映射
 - 姿态历史插值、历史边界和短时预测
 - 处理、通信、飞行时间及总延迟统计
+- 11 维 EKF 的两对装甲板结构差异（Δr/Δz）收敛
+- 瞄准解算的耷拉角补偿、提前量、pitch 符号与竖轴约定
 
 ```bash
 ctest --test-dir build --output-on-failure

@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "control/aim_solver.hpp"
 #include "core/config.hpp"
 #include "core/frame.hpp"
 #include "runtime/frame_processor.hpp"
@@ -138,6 +139,11 @@ class RealtimePipeline {
   // 作用：把一条原始包变成可用的云台样本并入库。实现：时钟同步、字段拷贝、history_.push、计数。
   // 参数：packet —— 串口刚收上来的反馈包。返回：无，同步失败或时间不递增就静默丢弃。
   void handleFeedback(const comm::GimbalToVision& packet);
+  // 作用：解一条瞄准指令，按配置打印或下发。实现：AimSolver 出角度，填 VisionToGimbal 后 send。
+  // 参数：frame —— 本帧（取时间戳算延迟）；attitude —— 本帧的云台反馈（取弹速和自报角度）；
+  //      state —— EKF 状态；command_ready_time —— 命令打包时刻。
+  void issueCommand(const core::TimestampedFrame& frame, const kalfilter::GimbalSample& attitude,
+                    const kalfilter::KFResult& state, double command_ready_time, int detections);
   // 作用：统一记错误并返回失败。实现：写 last_error_，有外部指针就一并带出。
   // 参数：message —— 错误原因；error —— 可选出错信息出口。返回：恒定 false，方便直接 return fail(...)。
   bool fail(const std::string& message, std::string* error);
@@ -158,6 +164,15 @@ class RealtimePipeline {
 
   // 作用：真正干检测和滤波的处理器。实现：值成员，构造时把 config_ 传进去。
   FrameProcessor processor_;
+
+  // 作用：把滤波状态解成云台指令。实现：值成员，构造时吃 control 配置。
+  control::AimSolver aim_;
+  // 作用：调试打印限流，避免 30 fps 刷屏。实现：记住上次打印的时刻。
+  double last_aim_log_time_{-1.0};
+  // 作用：发送失败只报一次，别每帧刷屏。实现：失败置真，成功清掉。
+  bool send_error_reported_{};
+  // 作用：首条 C 板反馈只打印一次。实现：打过后置真。
+  bool has_feedback_log_{};
 
   // 作用：运行开关，主循环和反馈线程都盯着它。实现：atomic bool，start 置真、stop 置假。
   std::atomic_bool running_{false};

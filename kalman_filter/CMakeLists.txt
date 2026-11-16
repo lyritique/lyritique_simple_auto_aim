@@ -44,6 +44,7 @@ add_executable(
     src/app/cli.cc
     src/app/main.cc
     src/app/mode_runner.cc
+    src/control/aim_solver.cc
     src/debug/draw.cc
     src/estimation/kalman_filter.cc
     src/runtime/frame_processor.cc
@@ -171,6 +172,30 @@ if(BUILD_TESTING)
     add_test(
         NAME kalman_noise_frame_test
         COMMAND kalman_noise_frame_test
+    )
+
+    add_executable(
+        kalman_armor_pair_test
+        tests/kalman_armor_pair_test.cpp
+        src/estimation/kalman_filter.cc
+    )
+    target_include_directories(kalman_armor_pair_test PRIVATE src/)
+    target_link_libraries(kalman_armor_pair_test PRIVATE Eigen3::Eigen)
+    add_test(
+        NAME kalman_armor_pair_test
+        COMMAND kalman_armor_pair_test
+    )
+
+    add_executable(
+        aim_solver_test
+        tests/aim_solver_test.cpp
+        src/control/aim_solver.cc
+    )
+    target_include_directories(aim_solver_test PRIVATE src/)
+    target_link_libraries(aim_solver_test PRIVATE Eigen3::Eigen)
+    add_test(
+        NAME aim_solver_test
+        COMMAND aim_solver_test
     )
 endif()
 

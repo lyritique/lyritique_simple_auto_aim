@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <utility>
 
 #include "sensors/mvs_camera.hpp"
@@ -12,9 +13,21 @@
 namespace realtime {
 namespace {
 
+constexpr double kRad2Deg = 57.29577951308232;
+
 // 作用：拿当前 steady_clock 的秒数，全链路统一的时间尺。实现：取 time_since_epoch 再转成 double 秒。
 double steadyNowSeconds() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// 作用：把 C 板自报的 yaw/pitch 和四元数解出来的对一下。
+//       C 板的 yaw/pitch 是它体轴 +x（光轴方向）的方位角和仰角（世界 z 朝天），
+//       所以这里必须取 UnitX；取 UnitZ 是相机系的轴，跟它对不上。
+void logAttitudeConvention(const kalfilter::GimbalSample& attitude) {
+  const Eigen::Vector3d axis = attitude.q * Eigen::Vector3d::UnitX();
+  std::clog << "board yaw=" << attitude.yaw * kRad2Deg << "° pitch=" << attitude.pitch * kRad2Deg
+            << "° | 体轴+x az=" << std::atan2(axis.y(), axis.x()) * kRad2Deg << "° el="
+            << std::asin(std::clamp(axis.z(), -1.0, 1.0)) * kRad2Deg << "°";
 }
 
 }  // namespace
@@ -25,7 +38,16 @@ RealtimePipeline::RealtimePipeline(RealtimePipelineConfig config)
       clock_(config_.serial.communication_latency),
       history_(config_.timing.max_history_seconds, config_.timing.max_attitude_gap_seconds,
                config_.timing.max_attitude_prediction_seconds),
-      processor_(config_) {}
+      processor_(config_),
+      aim_(control::AimConfig{config_.control.bullet_speed,
+                              config_.control.yaw_sign,
+                              config_.control.pitch_sign,
+                              config_.control.yaw_offset_deg * 0.017453292519943295,
+                              config_.control.pitch_offset_deg * 0.017453292519943295,
+                              config_.control.cam_remap,
+                              config_.control.up_axis == 1,
+                              config_.control.compensate_drop,
+                              config_.control.gravity}) {}
 
 // 作用：对象销毁时别把设备晾着。实现：转调 stop() 收拾线程和串口。
 RealtimePipeline::~RealtimePipeline() { stop(); }
@@ -49,6 +71,10 @@ bool RealtimePipeline::start(std::string* error) {
   has_q_init_ = false;
   q_init_.setIdentity();
   last_feedback_receive_time_.store(0.0);
+  aim_.reset();
+  last_aim_log_time_ = -1.0;
+  send_error_reported_ = false;
+  has_feedback_log_ = false;
 
   // 作用：计数器全部归零，统计从新的一段开始。实现：锁内整体赋值一个空 PipelineStats。
   {
@@ -65,7 +91,9 @@ bool RealtimePipeline::start(std::string* error) {
 
     // 作用：打开串口，反馈线程就靠它吃饭。实现：SerialLink::open 带设备路径和波特率，失败就报错。
     if (!serial_.open(config_.serial.device.c_str(), config_.serial.baud)) {
-      return fail("串口打开失败: " + config_.serial.device + " @" + std::to_string(config_.serial.baud), error);
+      return fail("串口打开失败: " + config_.serial.device + " @" + std::to_string(config_.serial.baud) + " -> " +
+                      serial_.lastError(),
+                  error);
     }
   }
 
@@ -101,7 +129,7 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
     if (csv) {
       // 时间戳是 steady_clock 的秒数，量级 1e5，默认 6 位有效数字只剩 1 秒精度。
       csv << std::fixed << std::setprecision(6);
-      csv << "time,valid,px,py,pz,yaw,vx,vy,vz,vyaw,r," << "latency_ms,detections,feedback\r\n";
+      csv << "time,valid,px,py,pz,yaw,vx,vy,vz,vyaw,r,dr,dz," << "latency_ms,detections,feedback\r\n";
     }
 
     if (config_.log_observations) {
@@ -113,13 +141,22 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
     }
   }
 
+  // 作用：分段计时累加器，把「等帧 / 处理 / 落盘」拆开看。实现：单线程局部变量，够 50 帧打一次。
+  double prof_read = 0.0;
+  double prof_process = 0.0;
+  double prof_write = 0.0;
+  double prof_cycle = 0.0;
+  int prof_frames = 0;
+
   // 作用：两个停止条件都要看：自己不想跑了，或外部喊停。实现：while 同时检查 running_ 和 external_stop。
   while (running_.load() && !external_stop.load()) {
+    const auto cycle_start = std::chrono::steady_clock::now();
     // 作用：准备一个空帧和错误槽，交给相机去填。实现：栈上默认构造。
     core::TimestampedFrame frame;
     std::string error;
     // 作用：向相机要一帧。实现：read 返回状态码，后续分支处理。
     const auto status = camera_->read(frame, &error);
+    const auto read_done = std::chrono::steady_clock::now();
     // 作用：暂时没图不算错误，下一轮再要。实现：Timeout 就 continue，不计数。
     if (status == core::FrameReadStatus::Timeout) continue;
 
@@ -134,10 +171,11 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
 
     // 作用：好帧就进入加工流水线。实现：直接调 processFrame，回调原样透传。
     const PipelineFrameResult result = processFrame(frame, callback);
+    const auto process_done = std::chrono::steady_clock::now();
 
     if (csv) {
       csv << result.frame_time << ',' << (result.state_valid ? 1 : 0) << ',';
-      for (int i = 0; i < 9; ++i) {
+      for (int i = 0; i < 11; ++i) {
         csv << result.state.state(i) << ',';
       }
       csv << result.process_latency << ',' << result.valid_detections << ',' << (result.feedback_available ? 1 : 0)
@@ -148,6 +186,26 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
       for (const auto& record : result.observations) {
         observation_csv << result.frame_time << ',' << record.azi << ',' << record.ele << ',' << record.dist << ','
                         << record.yaw << ',' << record.reproj_err << ',' << (record.sent_to_ekf ? 1 : 0) << "\r\n";
+      }
+    }
+
+    // 作用：把这一轮的三段耗时记下来，够 50 帧就打成一行。
+    // 实现：read 里面含等帧，所以它大说明相机节流；process 大说明推理慢。
+    if (config_.profile) {
+      const auto write_done = std::chrono::steady_clock::now();
+      const auto ms = [](const auto& a, const auto& b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+      };
+      prof_read += ms(cycle_start, read_done);
+      prof_process += ms(read_done, process_done);
+      prof_write += ms(process_done, write_done);
+      prof_cycle += ms(cycle_start, write_done);
+      if (++prof_frames >= 50) {
+        const double n = static_cast<double>(prof_frames);
+        std::clog << "[profile] cycle=" << prof_cycle / n << "ms  read=" << prof_read / n
+                  << "ms  process=" << prof_process / n << "ms  write=" << prof_write / n << "ms\n";
+        prof_read = prof_process = prof_write = prof_cycle = 0.0;
+        prof_frames = 0;
       }
     }
   }
@@ -293,12 +351,80 @@ PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame&
   timing.command_ready_time = command_ready_time;
   latency_.recordFrame(timing);
 
+  // 作用：状态可信就解一条云台指令。实现：算不发也行，debug_log 打开时会打印出来给实测判断。
+  if (config_.control.send || config_.control.debug_log) {
+    issueCommand(frame, attitude, result.state, command_ready_time, result.valid_detections);
+  }
+
   // 作用：有回调就通知一声，让外面画图或发指令。实现：std::function 非空才调用。
   if (callback) {
     callback(frame, result);
   }
 
   return result;
+}
+
+// 作用：把滤波状态解成一条云台指令，按配置打印或下发。实现：AimSolver 出角度，填包后交给 send()。
+void RealtimePipeline::issueCommand(const core::TimestampedFrame& frame, const kalfilter::GimbalSample& attitude,
+                                    const kalfilter::KFResult& state, double command_ready_time, int detections) {
+  // 作用：预测到指令生效时刻，超前量 = 本帧已花的处理时间 + 通信延迟，飞行时间在解算里迭代出来。
+  const double latency = (command_ready_time - frame.timestamp) + config_.serial.communication_latency;
+
+  const control::AimSolution solution =
+      aim_.solve(state, q_init_, attitude.q, latency, attitude.bullet_speed, command_ready_time);
+
+  // 作用：限流打印，0.5 s 一行。实现：第一次无条件打，之后隔 0.5 s。
+  const bool log_due = config_.control.debug_log &&
+                       (last_aim_log_time_ < 0.0 || command_ready_time - last_aim_log_time_ >= 0.5);
+  if (log_due) last_aim_log_time_ = command_ready_time;
+
+  if (!solution.valid) {
+    // 状态还没起来也要把 C 板自报的姿态打出来，测坐标系用不着等 EKF 收敛。
+    if (log_due) {
+      std::clog << std::fixed << std::setprecision(2) << "[aim] 状态无效 dets=" << detections << " | ";
+      logAttitudeConvention(attitude);
+      std::clog << '\n';
+    }
+    return;
+  }
+
+  // 作用：按协议填包。角度单位是弧度，和 C 板反馈一致。实现：逐字段赋值，vel/acc 由差分得到。
+  comm::VisionToGimbal packet{};
+  // C 板时钟上的"这条指令生成时刻"：本帧姿态的板卡时间 + 上位机侧流过的时间。
+  // 单位跟 C 板自己发来的 DWT_stamp 一致（毫秒）；board_time_us 是展开后的微秒，先换回毫秒。
+  const double age_seconds = std::max(0.0, command_ready_time - attitude.host_time);
+  packet.time_stamp =
+      attitude.board_time_us / 1000 + static_cast<uint64_t>(age_seconds * 1000.0);
+  packet.mode = config_.control.mode;
+  packet.pitch = static_cast<float>(solution.pitch);
+  packet.pitch_vel = static_cast<float>(solution.pitch_vel);
+  packet.pitch_acc = static_cast<float>(solution.pitch_acc);
+  packet.yaw = static_cast<float>(solution.yaw);
+  packet.yaw_vel = static_cast<float>(solution.yaw_vel);
+  packet.yaw_acc = static_cast<float>(solution.yaw_acc);
+
+  if (log_due) {
+    std::clog << std::fixed << std::setprecision(2) << "[aim] cmd yaw=" << solution.yaw * kRad2Deg
+              << "° pitch=" << solution.pitch * kRad2Deg << "° id=" << solution.armor_id
+              << " dist=" << solution.distance << "m fly=" << solution.flight_time * 1e3
+              << "ms stamp=" << packet.time_stamp << " age=" << age_seconds * 1e3 << "ms dets=" << detections
+              << " | ";
+    logAttitudeConvention(attitude);
+    std::clog << '\n';
+  }
+
+  if (!config_.control.send) return;
+
+  std::string error;
+  if (!send(packet, &error)) {
+    if (!send_error_reported_) {
+      send_error_reported_ = true;
+      std::cerr << "[aim] 指令发送失败: " << error << "（后续同类失败不再重复打印）\n";
+    }
+  } else {
+    send_error_reported_ = false;
+  has_feedback_log_ = false;
+  }
 }
 
 // 作用：等云台历史覆盖到目标时刻，最多等配置的毫秒数。实现：循环尝试插值，没成且没停就睡 1ms，到点或停机即认输。
@@ -336,8 +462,16 @@ void RealtimePipeline::feedbackLoop(std::stop_token stop_token) {
   // 作用：复用同一个包对象，省得每轮构造。实现：循环外声明。
   comm::GimbalToVision packet;
 
+  // 作用：起跑时刻记下来，2 秒还没收到合法包就提醒一次。实现：循环外取一次 steady 时间。
+  const double loop_start = steadyNowSeconds();
+  bool warned_no_feedback = false;
+
   // 作用：只要还在跑且没被请求停止就继续收。实现：while 同时检查 running_ 和 stop_token。
   while (running_.load() && !stop_token.stop_requested()) {
+    if (!has_feedback_log_ && !warned_no_feedback && steadyNowSeconds() - loop_start > 2.0) {
+      warned_no_feedback = true;
+      std::cerr << "[C板] 串口开着但两秒内没收到合法包：检查波特率、协议版本和校验和。\n";
+    }
     // 作用：记录这一轮有没有收到东西，决定要不要睡。实现：bool 标志。
     bool received = false;
     // 作用：把串口里积压的包一口气全取出来。实现：while poll 成功就处理，直到没包可读。
@@ -380,6 +514,15 @@ void RealtimePipeline::handleFeedback(const comm::GimbalToVision& packet) {
 
   // 作用：入库失败一般是时间没前进，直接丢弃，不入账。实现：push 返回假就 return。
   if (!history_.push(sample)) return;
+
+  // 作用：第一条合法反馈打一行，确认协议解析、时钟同步和字段都对。实现：只打一次。
+  if (!has_feedback_log_) {
+    has_feedback_log_ = true;
+    std::clog << std::fixed << std::setprecision(2) << "[C板] 首条反馈 DWT=" << packet.DWT_stamp
+              << "ms -> 上位机 " << event_host_time << "s, pitch=" << packet.pitch * kRad2Deg
+              << "° yaw=" << packet.yaw * kRad2Deg << "°, 弹速=" << packet.bullet_speed
+              << ", mode=" << static_cast<int>(packet.mode) << '\n';
+  }
 
   // 作用：更新“最近收到反馈”的时刻，顺便累计收包数。实现：atomic store 加锁内自增。
   last_feedback_receive_time_.store(receive_time);

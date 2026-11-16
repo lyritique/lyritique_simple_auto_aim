@@ -3,6 +3,7 @@
 
 #include <string>
 
+#include "control/aim_solver.hpp"
 #include "core/config.hpp"
 
 namespace realtime {
@@ -25,6 +26,10 @@ class ReplayPipeline {
  private:
   // 作用：回放所需的全部参数：视频路径、IMU 路径、输出目录、时间偏移。实现：值成员，构造时移入，之后只读。
   core::AppConfig config_;
+  // 作用：离线验证瞄准解算用，只打印不发送。实现：和实时链路同一个 AimSolver。
+  control::AimSolver aim_;
+  // 作用：打印限流，0.5 s 一行。实现：记住上次打印时刻。
+  double last_aim_log_time_{-1.0};
 };
 
 }  // namespace realtime

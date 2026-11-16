@@ -213,6 +213,107 @@ CliResult parseCommandLine(int argc, char** argv) {
       }
       continue;
     }
+    // 作用：允许把视觉指令真正写进串口。实现：打开 control.send。
+    if (arg == "--send-control") {
+      result.config.control.send = true;
+      continue;
+    }
+    // 作用：打印解算出的指令和 C 板自报姿态，先判断坐标系约定。实现：打开 control.debug_log。
+    if (arg == "--aim-debug") {
+      result.config.control.debug_log = true;
+      continue;
+    }
+    // 作用：设弹速兜底值。实现：parseDouble 后写 control.bullet_speed。
+    if (arg == "--bullet-speed") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseDouble(*value, result.config.control.bullet_speed)) {
+        result.error = "无效的弹速: " + *value;
+        break;
+      }
+      continue;
+    }
+    // 作用：设指令人机模式字节。实现：parseInt 后夹到 uint8_t。
+    if (arg == "--command-mode") {
+      const auto* value = requireValue();
+      if (!value) break;
+      int mode = 0;
+      if (!parseInt(*value, mode) || mode < 0 || mode > 255) {
+        result.error = "无效的指令模式: " + *value;
+        break;
+      }
+      result.config.control.mode = static_cast<uint8_t>(mode);
+      continue;
+    }
+    // 作用：设 yaw 正方向，实测反了就传 -1。实现：parseDouble 后写 control.yaw_sign。
+    if (arg == "--yaw-sign") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseDouble(*value, result.config.control.yaw_sign)) {
+        result.error = "无效的 yaw 符号: " + *value;
+        break;
+      }
+      continue;
+    }
+    // 作用：调检测置信度阈值，现场目标太暗/太小时往下调。实现：parseFloat 写 detector.score_threshold。
+    if (arg == "--score-threshold") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseFloat(*value, result.config.detector.score_threshold)) {
+        result.error = "无效的置信度阈值: " + *value;
+        break;
+      }
+      continue;
+    }
+    // 作用：关掉相机系到 C 板体轴的换轴，只在排查坐标系问题时用。实现：置 false。
+    if (arg == "--no-cam-remap") {
+      result.config.control.cam_remap = false;
+      continue;
+    }
+    // 作用：设 yaw 零位补偿（度）。实现：C 板 yaw 与四元数世界 yaw 的固定差值填这里。
+    if (arg == "--yaw-offset") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseDouble(*value, result.config.control.yaw_offset_deg)) {
+        result.error = "无效的 yaw 零位: " + *value;
+        break;
+      }
+      continue;
+    }
+    // 作用：设 pitch 零位补偿（度）。实现：同上，一般不用填。
+    if (arg == "--pitch-offset") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseDouble(*value, result.config.control.pitch_offset_deg)) {
+        result.error = "无效的 pitch 零位: " + *value;
+        break;
+      }
+      continue;
+    }
+    // 作用：设 pitch 正方向，y 朝天给 1，向下为正给 -1。实现：parseDouble 后写 control.pitch_sign。
+    if (arg == "--pitch-sign") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseDouble(*value, result.config.control.pitch_sign)) {
+        result.error = "无效的 pitch 符号: " + *value;
+        break;
+      }
+      continue;
+    }
+    // 作用：设 C 板世界系哪根轴朝天，决定 yaw/pitch 怎么取。实现：y 或 z 二选一。
+    if (arg == "--up-axis") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (*value == "y") {
+        result.config.control.up_axis = 0;
+      } else if (*value == "z") {
+        result.config.control.up_axis = 1;
+      } else {
+        result.error = "无效的竖轴: " + *value + "（只支持 y 或 z）";
+        break;
+      }
+      continue;
+    }
     // 作用：选 MVS 相机索引。实现：parseUInt 后写 camera.device_index，负数或垃圾值直接报错。
     if (arg == "--camera-index") {
       const auto* value = requireValue();
@@ -466,16 +567,17 @@ void printUsage(std::ostream& out) {
          "  --exposure-us US      设置曝光时间，0 表示不修改\n"
          "  --exposure-preset P   dark / indoor / bright，一次配好曝光+增益+帧率\n"
          "  --gain G              设置增益，负数表示不修改\n"
-         "  --camera-time-source S  host 或 device，默认 device\n"
+         "  --camera-time-source S  host 或 device，默认 host（设备戳要求帧率跑满）\n"
          "  --camera-time-offset-us US  帧时间常数偏移，台架标定用\n"
          "  --camera-exposure-anchor R  设备戳在曝光区间的比例，0~1，默认 0.5\n"
          "  --no-chunk-exposure   关闭 Chunk-Exposure，不读每帧曝光\n"
          "  --camera-timing-log   打印时钟校准结果和每帧时间戳\n"
          "  --camera-calib-seconds S  设备时钟校准窗口，标定 ns/tick 时给几百秒\n"
-         "  --camera-tick-ns NS   直接指定每 tick 纳秒数，跳过拟合\n"
+         "  --camera-tick-ns NS   每 tick 纳秒数，默认 10（相机 100 MHz），不用改\n"
          "  --no-imu              不用 C 板姿态，假定云台静止（串口可不接）\n"
          "  --log-observations    把每块装甲板的原始观测量写入 observations.csv\n"
          "  --profile             每 50 帧打印一次各阶段平均耗时\n"
+         "  --score-threshold F   检测置信度阈值，默认 0.5；现场目标小/暗时往低调\n"
          "  --detector-backend B  auto / trt / cuda / cpu，默认 auto（TensorRT→CUDA→CPU）\n"
          "  --no-fp16             关闭 TensorRT FP16\n"
          "  --trt-cache DIR       TensorRT engine 缓存目录，空字符串禁用\n"
@@ -483,7 +585,17 @@ void printUsage(std::ostream& out) {
          "  --serial PATH         串口设备\n"
          "  --baud N              串口波特率\n"
          "  --comm-latency S      通信延迟估计，秒\n"
-         "  --max-distance M      送入 EKF 的最大目标距离\n";
+         "  --max-distance M      送入 EKF 的最大目标距离\n"
+         "  --aim-debug           打印解算指令与 C 板自报姿态，判断坐标系约定\n"
+         "  --send-control        真正把 VisionToGimbal 写进串口（默认只算不发）\n"
+         "  --bullet-speed F      弹速兜底值，C 板没报时用，m/s\n"
+         "  --command-mode N      指令里的 mode 字节，含义由 C 板定义\n"
+         "  --yaw-sign F          C 板世界系 yaw 正方向，实测反了传 -1\n"
+         "  --yaw-offset DEG      yaw 零位补偿，实测无固定偏差，一般留 0\n"
+         "  --pitch-offset DEG    pitch 零位补偿，一般不用填\n"
+         "  --no-cam-remap        关闭相机系->C 板体轴的换轴，排查坐标系时用\n"
+         "  --pitch-sign F        pitch 正方向，抬头为正是 1，反之 -1\n"
+         "  --up-axis y|z         C 板世界系哪根轴朝天，默认 z（实测约定）\n";
 }
 
 }  // namespace app

@@ -2,6 +2,8 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <memory>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
@@ -21,7 +23,17 @@ Eigen::Matrix3d toMatrix(const Eigen::Quaterniond& q) { return q.normalized().to
 }  // namespace
 
 // 作用：把配置收进来，回放时按它找文件和输出目录。实现：移动构造一个配置成员。
-ReplayPipeline::ReplayPipeline(core::AppConfig config) : config_(std::move(config)) {}
+ReplayPipeline::ReplayPipeline(core::AppConfig config)
+    : config_(std::move(config)),
+      aim_(control::AimConfig{config_.control.bullet_speed,
+                              config_.control.yaw_sign,
+                              config_.control.pitch_sign,
+                              config_.control.yaw_offset_deg * 0.017453292519943295,
+                              config_.control.pitch_offset_deg * 0.017453292519943295,
+                              config_.control.cam_remap,
+                              config_.control.up_axis == 1,
+                              config_.control.compensate_drop,
+                              config_.control.gravity}) {}
 
 // 作用：离线跑完整条链路，产出带框视频和状态 CSV。实现：准备工作全放在 try 里，任何一步失败都转成 error 字符串返回。
 bool ReplayPipeline::run(std::string* error) {
@@ -72,7 +84,7 @@ bool ReplayPipeline::run(std::string* error) {
       return false;
     }
     // 作用：写表头，列名就是后面要填的状态顺序。实现：先写一行固定的逗号分隔字段。
-    csv << "time,valid,px,py,pz,yaw,vx,vy,vz,vyaw,r\r\n";
+    csv << "time,valid,px,py,pz,yaw,vx,vy,vz,vyaw,r,dr,dz\r\n";
 
     // 作用：每帧都要用它跑检测和滤波，循环外建一次省得反复构造。实现：局部 FrameProcessor。
     FrameProcessor processor(config_);
@@ -130,12 +142,27 @@ bool ReplayPipeline::run(std::string* error) {
         draw::drawFourArmorReprojections(frame, output, processor.cameraMatrix(), processor.distortionCoeffs(), false);
       }
 
-      // 作用：把本帧结果写进 CSV，无效帧单独标注。实现：invalid 就写“偏离过大”，否则写时间、9 维状态和重投影误差。
+      // 作用：离线验证瞄准解算，只看角度跟不跟得上，不发任何东西。实现：0.5 s 打一行。
+      if (config_.control.debug_log && output.valid &&
+          (last_aim_log_time_ < 0.0 || image_time - last_aim_log_time_ >= 0.5)) {
+        last_aim_log_time_ = image_time;
+        const Eigen::Quaterniond q_init(R_0);
+        const Eigen::Quaterniond q_now(imu_k.q);
+        const auto aim = aim_.solve(output, q_init, q_now, config_.serial.communication_latency, 0.0, image_time);
+        constexpr double kRad2Deg = 57.29577951308232;
+        if (aim.valid) {
+          std::clog << std::fixed << std::setprecision(2) << "[aim] t=" << image_time << " yaw=" << aim.yaw * kRad2Deg
+                    << "° pitch=" << aim.pitch * kRad2Deg << "° id=" << aim.armor_id << " dist=" << aim.distance
+                    << "m fly=" << aim.flight_time * 1e3 << "ms\n";
+        }
+      }
+
+      // 作用：把本帧结果写进 CSV，无效帧单独标注。实现：invalid 就写“偏离过大”，否则写时间、11 维状态和重投影误差。
       if (!output.valid) {
         csv << image_time << "偏离过大" << "\r\n";
       } else {
         csv << image_time << ',' << output.valid << ',';
-        for (int i = 0; i < 9; ++i) {
+        for (int i = 0; i < 11; ++i) {
           csv << output.state(i) << ',';
         }
         for (const double value : processing.reprojection_errors) {

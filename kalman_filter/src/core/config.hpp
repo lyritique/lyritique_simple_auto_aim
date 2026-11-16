@@ -1,6 +1,7 @@
 #ifndef AUTOAIM_CORE_CONFIG_HPP
 #define AUTOAIM_CORE_CONFIG_HPP
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -41,7 +42,11 @@ struct CameraConfig {
   float gain{-1.0F};
 
   // 时间戳策略：把相机设备时钟映射到主机单调钟。
-  bool use_device_timestamp{true};
+  // 默认关：这台相机的设备戳按「设定帧率」计数，实际帧率一旦达不到设定值
+  // （25 ms 曝光 + 读出开销 ≈ 40 ms，只能跑 24.9 fps），戳就会以每秒几毫秒的速度落后，
+  // 跑一分钟偏几秒。收帧时刻自带 1~2 ms 抖动但没有系统偏差，更稳妥。
+  // 想要低抖动、且确认相机能跑满设定帧率时，再开 --camera-time-source device。
+  bool use_device_timestamp{false};
   // 台架测出的常数偏差，正值表示把帧时间往后挪（µs）。
   double timestamp_offset_us{0.0};
   // 设备戳落在曝光区间的比例：0=曝光开始，0.5=中点，1=结束。
@@ -52,8 +57,10 @@ struct CameraConfig {
   bool timing_log{false};
   // 设备时钟在线校准窗口（秒）。0 表示按 100 帧算；标定 ns/tick 时给几百秒。
   double calib_seconds{0.0};
-  // 已知的每 tick 纳秒数。>0 就跳过斜率拟合直接用，长期标定后填这里。
-  double tick_ns{0.0};
+  // 已知的每 tick 纳秒数。默认 10，对应相机 100 MHz 计数器，
+  // 实测已验证：60 fps 下 Δtick=1667091（16.671 ms），20 fps 下 5017847（50.178 ms）。
+  // 只有在换相机或要重新标定时才改，填了就不再做斜率拟合。
+  double tick_ns{10.0};
 };
 
 // 场地曝光预设：曝光时间、增益、帧率三者必须一起配，改一个不改另一个会互相打架。
@@ -112,9 +119,35 @@ struct DetectorConfig {
 };
 
 struct SerialConfig {
-  std::string device{"/dev/ttyUSB0"};
+  std::string device{"/dev/ttyACM0"};
   int baud{115200};
   double communication_latency{0.0};
+};
+
+// 云台指令。默认只算不发：时间同步和弹道都没验证之前，别让云台自己动。
+struct ControlConfig {
+  // 真的把 VisionToGimbal 写进串口。不开就只在开了 debug_log 时打印。
+  bool send{false};
+  // 打印“算出来的指令”和“C 板自己报的姿态”，先用实测数据判断坐标系约定。
+  bool debug_log{false};
+  // 指令里的 mode 字节，含义由 C 板定义，默认 0。
+  uint8_t mode{0};
+  // C 板没报弹速时的兜底值，m/s。
+  double bullet_speed{25.0};
+  // C 板世界系 yaw / pitch 的正方向。实测发现反了就传 -1，不用改代码。
+  double yaw_sign{1.0};
+  double pitch_sign{1.0};
+  // 零位补偿（度）：C 板控制用的 yaw 零位和它四元数世界系的 yaw 不一致时，差值填这里。
+  double yaw_offset_deg{0.0};
+  double pitch_offset_deg{0.0};
+  // 把 EKF 的相机系观测换到 C 板体轴（x 前/y 左/z 上）。关掉只在排查坐标系问题时用。
+  bool cam_remap{true};
+  // C 板世界系哪根轴朝天：0 = y 轴（x-z 水平），1 = z 轴（x-y 水平，yaw=atan2(y,x)）。
+  // 实测确认是 z 朝天（C 板 yaw/pitch = 体轴 +x 的方位角/仰角），默认 1。
+  uint8_t up_axis{1};
+  // 弹道下坠补偿，未标定前默认关。
+  bool compensate_drop{false};
+  double gravity{9.8};
 };
 
 struct TimingConfig {
@@ -139,6 +172,7 @@ struct AppConfig {
   DetectorConfig detector;
   SerialConfig serial;
   TimingConfig timing;
+  ControlConfig control;
 
   // 无 IMU 模式：不打开串口、不等待云台姿态，世界系固定在初始相机系（假定云台静止）。
   bool imu_enabled{true};

@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
+#include <string>
 
 namespace comm {
 namespace {
@@ -57,6 +59,20 @@ speed_t baudToSpeed(int baud) {
   }
 }
 
+// 作用：把 /dev 下现成的串口列出来，打开失败时直接告诉用户该用哪个。实现：目录遍历筛 ttyACM*/ttyUSB*。
+std::string listSerialCandidates() {
+  std::string out;
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator("/dev", ec)) {
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("ttyACM", 0) == 0 || name.rfind("ttyUSB", 0) == 0) {
+      if (!out.empty()) out += ", ";
+      out += entry.path().string();
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 // 析构函数
@@ -71,12 +87,23 @@ bool SerialLink::open(const char* dev, int baud) {
   if (speed == 0) return false;
 
   const int fd = ::open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
-  if (fd < 0) return false;
+  if (fd < 0) {
+    last_error_ = std::string("open 失败: ") + std::strerror(errno);
+    if (errno == ENOENT) {
+      const std::string candidates = listSerialCandidates();
+      last_error_ += candidates.empty() ? "（/dev 下没有 ttyACM*/ttyUSB*，设备可能没 attach 到 WSL）"
+                                        : "（现有串口: " + candidates + "）";
+    } else if (errno == EACCES) {
+      last_error_ += "（当前用户没有该设备的读写权限，检查 dialout 组）";
+    }
+    return false;
+  }
 
   // 新建一个配置盒子
   termios options{};
   // 把当前串口通信模式写进配置盒子
   if (::tcgetattr(fd, &options) != 0) {
+    last_error_ = std::string("tcgetattr 失败: ") + std::strerror(errno) + "（这个设备不是终端）";
     ::close(fd);
     return false;
   }
@@ -99,12 +126,14 @@ bool SerialLink::open(const char* dev, int baud) {
   if (::cfsetispeed(&options, speed) != 0 ||                                           // 设置输入输出波特率
       ::cfsetospeed(&options, speed) != 0 || ::tcsetattr(fd, TCSANOW, &options) != 0)  // 把option写回内核
   {
+    last_error_ = std::string("设置波特率失败: ") + std::strerror(errno) + "（这个波特率可能不支持）";
     ::close(fd);
     return false;
   }
 
   // 清空缓存区
   ::tcflush(fd, TCIOFLUSH);
+  last_error_.clear();
   fd_ = fd;
   rx_size_ = 0;
   return true;
