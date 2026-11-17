@@ -82,6 +82,8 @@ class MvsCamera final : public CameraSource {
   double clock_spread_ms_{};  // 校准样本极差，诊断用
   // 节点读不到设备戳时，改用前若干帧的「收帧时刻 - 设备戳」做在线校准。
   int calib_frames_left_{};
+  // 积压时被跳过的旧帧总数，用来判断处理是否跟不上相机产出。
+  uint64_t stale_dropped_{};
   std::vector<std::uint64_t> calib_ticks_;
   std::vector<double> calib_hosts_;
   // 校准窗口时长（秒）。>0 时按时间收样本，用来长时间标定 ns/tick。

@@ -345,8 +345,6 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
 
   MV_FRAME_OUT raw{};
   int ret = MV_CC_GetImageBuffer(handle_, &raw, static_cast<unsigned int>(std::max(1, config_.timeout_ms)));
-  // 收帧时刻只当兜底：设备时钟校准成功后，会用相机自己的戳。
-  const double host_time = steadyNowSeconds();
 
   if (ret != MV_OK) {
     // 超时是正常剧情：相机这轮没新帧，不算故障。
@@ -356,6 +354,28 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
 
     fail("MV_CC_GetImageBuffer 失败: " + hexCode(ret), error);
     return core::FrameReadStatus::Error;
+  }
+
+  // 拿到一帧之后再看队列里还有没有更新的：SDK 是先进先出，积压时手里这张
+  // 可能是几秒前的旧图。只留最新的一张，中间的丢掉，否则延迟会无上限累积。
+  // 用 0 超时不阻塞，取到 NODATA/TIMEOUT 就说明追平了。
+  int stale = 0;
+  for (; stale < 16; ++stale) {
+    MV_FRAME_OUT newer{};
+    if (MV_CC_GetImageBuffer(handle_, &newer, 0) != MV_OK) break;
+    MV_CC_FreeImageBuffer(handle_, &raw);
+    raw = newer;
+  }
+
+  // 收帧时刻只当兜底：设备时钟校准成功后，会用相机自己的戳。
+  const double host_time = steadyNowSeconds();
+
+  if (stale > 0) {
+    stale_dropped_ += static_cast<uint64_t>(stale);
+    // 每跳 200 帧提示一次，说明处理跟不上相机产出。
+    if (stale_dropped_ % 200 < static_cast<uint64_t>(stale)) {
+      std::clog << "[相机] 已跳过 " << stale_dropped_ << " 帧旧图（处理跟不上，只保留最新帧）\n";
+    }
   }
 
   // 打包，写的有些繁复
