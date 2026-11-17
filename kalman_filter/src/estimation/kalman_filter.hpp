@@ -22,7 +22,7 @@ struct KalmanConfig {
   double ele{0.032};
   double azi{0.032};
   double k_dist{0.05};
-  double yaw{0.012};
+  double yaw{0.2};
 
   double assoc_pos_gate{2.5};
   double max_yaw_innovation{0.7853981633974483};  // 45 度
