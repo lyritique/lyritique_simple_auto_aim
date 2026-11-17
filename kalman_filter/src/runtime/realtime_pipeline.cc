@@ -6,8 +6,10 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <opencv2/highgui.hpp>
 #include <utility>
 
+#include "debug/draw.hpp"
 #include "sensors/mvs_camera.hpp"
 
 namespace realtime {
@@ -148,6 +150,10 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
   double prof_cycle = 0.0;
   int prof_frames = 0;
 
+  // 作用：画图耗时单独累计，别让 imshow 的等待混进 process 计时里。实现：单线程局部变量，够 50 帧打一行。
+  double draw_total_ms = 0.0;
+  int draw_frames = 0;
+
   // 作用：两个停止条件都要看：自己不想跑了，或外部喊停。实现：while 同时检查 running_ 和 external_stop。
   while (running_.load() && !external_stop.load()) {
     const auto cycle_start = std::chrono::steady_clock::now();
@@ -186,6 +192,16 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
       for (const auto& record : result.observations) {
         observation_csv << result.frame_time << ',' << record.azi << ',' << record.ele << ',' << record.dist << ','
                         << record.yaw << ',' << record.reproj_err << ',' << (record.sent_to_ekf ? 1 : 0) << "\r\n";
+      }
+    }
+
+    // 作用：开了调试画图就累计耗时，每 50 帧打一行平均，独立于 --profile。实现：累加 draw_ms 后判断帧数。
+    if (config_.debug_draw) {
+      draw_total_ms += result.draw_ms;
+      if (++draw_frames >= 50) {
+        std::clog << "[draw] 平均 " << draw_total_ms / draw_frames << "ms/帧（画图+imshow+waitKey）\n";
+        draw_total_ms = 0.0;
+        draw_frames = 0;
       }
     }
 
@@ -235,6 +251,11 @@ void RealtimePipeline::stop() {
   // 作用：有相机就关，串口也顺手关掉。实现：空指针检查和 close。
   if (camera_) camera_->close();
   serial_.close();
+
+  // 作用：链路停了就把调试窗口收掉，别留一个卡住的画面。实现：开关打开时 destroyWindow。
+  if (config_.debug_draw) {
+    cv::destroyWindow("debug draw");
+  }
 }
 
 // 作用：给上层留的发送口，目前控制层还没用上。实现：串口 send，失败就统一记错误。
@@ -354,6 +375,26 @@ PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame&
   // 作用：状态可信就解一条云台指令。实现：算不发也行，debug_log 打开时会打印出来给实测判断。
   if (config_.control.send || config_.control.debug_log) {
     issueCommand(frame, attitude, result.state, command_ready_time, result.valid_detections);
+  }
+
+  // 作用：调试开关打开就把这一帧画出来并显示，窗口里的画面保持到下一帧刷新或链路停止。
+  // 实现：在副本上画检测框、四面装甲板重投影和状态面板，imshow 后 waitKey(1) 泵一下 GUI 事件；
+  // 画图放在指令之后，imshow 的等待不拖慢控制下发，耗时单独记在 draw_ms 里。
+  if (config_.debug_draw) {
+    const auto draw_start = std::chrono::steady_clock::now();
+
+    cv::Mat debug_frame = frame.bgr.clone();
+    draw::drawDetections(debug_frame, processing.detections);
+    if (result.state_valid) {
+      draw::drawFourArmorReprojections(debug_frame, result.state, R_C0C, processor_.cameraMatrix(),
+                                       processor_.distortionCoeffs(), false);
+    }
+    draw::drawStateText(debug_frame, result.state);
+    cv::imshow("debug draw", debug_frame);
+    cv::waitKey(1);
+
+    result.draw_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - draw_start).count();
   }
 
   // 作用：有回调就通知一声，让外面画图或发指令。实现：std::function 非空才调用。

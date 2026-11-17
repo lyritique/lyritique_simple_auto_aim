@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 #include <utility>
@@ -86,6 +87,17 @@ bool ReplayPipeline::run(std::string* error) {
     // 作用：写表头，列名就是后面要填的状态顺序。实现：先写一行固定的逗号分隔字段。
     csv << "time,valid,px,py,pz,yaw,vx,vy,vz,vyaw,r,dr,dz\r\n";
 
+    // 作用：需要标定观测噪声时，把每块板的原始观测也落盘，字段和实时模式一致。
+    // 实现：受 log_observations 控制，输出 observations.csv。
+    std::ofstream observation_csv;
+    if (config_.log_observations) {
+      observation_csv.open(config_.output_directory + "/observations.csv");
+      if (observation_csv) {
+        observation_csv << std::fixed << std::setprecision(9);
+        observation_csv << "time,azi,ele,dist,yaw,reproj_err,sent_to_ekf\r\n";
+      }
+    }
+
     // 作用：每帧都要用它跑检测和滤波，循环外建一次省得反复构造。实现：局部 FrameProcessor。
     FrameProcessor processor(config_);
 
@@ -132,6 +144,11 @@ bool ReplayPipeline::run(std::string* error) {
         for (const auto& point : observation.refined_corners) {
           cv::circle(frame, point, 2, cv::Scalar(255, 0, 255), 10);
         }
+        if (observation_csv) {
+          observation_csv << image_time << ',' << observation.ypd.azi << ',' << observation.ypd.ele << ','
+                          << observation.ypd.dist << ',' << observation.ekf_yaw << ',' << observation.pose.err << ','
+                          << (observation.sent_to_ekf ? 1 : 0) << "\r\n";
+        }
       }
 
       // 作用：给滤波结果起个短名字，后面反复用。实现：常量引用 processing.state。
@@ -139,7 +156,7 @@ bool ReplayPipeline::run(std::string* error) {
 
       // 作用：状态可信就画四面装甲板的重投影，检验位姿准不准。实现：valid 时调 drawFourArmorReprojections。
       if (output.valid) {
-        draw::drawFourArmorReprojections(frame, output, processor.cameraMatrix(), processor.distortionCoeffs(), false);
+        draw::drawFourArmorReprojections(frame, output, R, processor.cameraMatrix(), processor.distortionCoeffs(), false);
       }
 
       // 作用：离线验证瞄准解算，只看角度跟不跟得上，不发任何东西。实现：0.5 s 打一行。
@@ -173,7 +190,19 @@ bool ReplayPipeline::run(std::string* error) {
 
       // 作用：把状态文字和这一帧一起写进输出视频。实现：先 drawStateText，再 writer.write。
       draw::drawStateText(frame, output);
+
+      // 作用：调试开关打开就把画完四面装甲板重投影的画面弹到屏幕上。实现：imshow + waitKey(1) 泵一下 GUI 事件。
+      if (config_.debug_draw) {
+        cv::imshow("debug draw", frame);
+        cv::waitKey(1);
+      }
+
       writer.write(frame);
+    }
+
+    // 作用：调试窗口用完得拆掉，不然进程退出后窗口还挂着。实现：开关打开时 destroyWindow。
+    if (config_.debug_draw) {
+      cv::destroyWindow("debug draw");
     }
 
     // 作用：收尾释放资源，保证文件落盘。实现：关 CSV、释放写入器、关视频源。

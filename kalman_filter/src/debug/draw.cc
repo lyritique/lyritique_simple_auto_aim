@@ -127,8 +127,8 @@ void drawStateText(cv::Mat& frame, const kalfilter::KFResult& state) {
   }
 }
 
-void drawFourArmorReprojections(cv::Mat& frame, const kalfilter::KFResult& state, const cv::Mat& camera_matrix,
-                                const cv::Mat& distortion_coeffs, bool big) {
+void drawFourArmorReprojections(cv::Mat& frame, const kalfilter::KFResult& state, const Eigen::Matrix3d& R_C0C,
+                                const cv::Mat& camera_matrix, const cv::Mat& distortion_coeffs, bool big) {
   if (!state.valid) return;
 
   constexpr double kPi = 3.14159265358979323846;
@@ -174,16 +174,27 @@ void drawFourArmorReprojections(cv::Mat& frame, const kalfilter::KFResult& state
     const double s = std::sin(theta);
     const double c = std::cos(theta);
 
-    // 装甲板坐标系 -> 相机坐标系
-    // 第 0 列：板法向
-    // 第 1 列：板宽度方向
-    // 第 2 列：板高度方向，当前约定为相机 y 向下
-    const cv::Mat rotation = (cv::Mat_<double>(3, 3) << s, c, 0.0, 0.0, 0.0, 1.0, c, -s, 0.0);
+    // 状态是世界系（C0），projectPoints 要的是相机系，中间差一个 R_C0C。
+    // 中心点和三个基向量一起转过去，否则云台一转整个叠加就会错位。
+    const Eigen::Matrix3d R_cam = R_C0C.transpose();
+    const Eigen::Vector3d center_w(center_x, center_y, center_z);
+    const Eigen::Vector3d normal_w(s, 0.0, c);
+    const Eigen::Vector3d width_w(c, 0.0, -s);
+    const Eigen::Vector3d height_w(0.0, 1.0, 0.0);
+
+    const Eigen::Vector3d center_c = R_cam * center_w;
+    const Eigen::Vector3d normal_c = R_cam * normal_w;
+    const Eigen::Vector3d width_c = R_cam * width_w;
+    const Eigen::Vector3d height_c = R_cam * height_w;
+
+    // 装甲板坐标系 -> 相机坐标系：三列依次是法向、宽度方向、高度方向
+    const cv::Mat rotation = (cv::Mat_<double>(3, 3) << normal_c.x(), width_c.x(), height_c.x(), normal_c.y(),
+                              width_c.y(), height_c.y(), normal_c.z(), width_c.z(), height_c.z());
 
     cv::Mat rvec;
     cv::Rodrigues(rotation, rvec);
 
-    const cv::Mat tvec = (cv::Mat_<double>(3, 1) << center_x, center_y, center_z);
+    const cv::Mat tvec = (cv::Mat_<double>(3, 1) << center_c.x(), center_c.y(), center_c.z());
 
     std::vector<cv::Point2d> projected;
     cv::projectPoints(object_points, rvec, tvec, camera_matrix, distortion_coeffs, projected);
