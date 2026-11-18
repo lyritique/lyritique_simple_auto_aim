@@ -84,6 +84,10 @@ class MvsCamera final : public CameraSource {
   int calib_frames_left_{};
   // 积压时被跳过的旧帧总数，用来判断处理是否跟不上相机产出。
   uint64_t stale_dropped_{};
+  // 排空探测的错误码只打印一次，避免刷屏。
+  bool drain_probe_logged_{};
+  // 取流策略是否已切成 LatestImagesOnly；切成后由 SDK 清旧帧，不用再手动排空。
+  bool grab_latest_only_{};
   std::vector<std::uint64_t> calib_ticks_;
   std::vector<double> calib_hosts_;
   // 校准窗口时长（秒）。>0 时按时间收样本，用来长时间标定 ns/tick。

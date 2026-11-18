@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "estimation/kalman_filter.hpp"
+
 namespace core {
 
 enum class RunMode { Replay, Live };
@@ -174,9 +176,20 @@ struct AppConfig {
   SerialConfig serial;
   TimingConfig timing;
   ControlConfig control;
+  // EKF 的运动/观测噪声，可用 --p-coord / --p-yaw / --pos-noise / --yaw-noise 现场调。
+  kalfilter::KalmanConfig kalman;
 
   // 无 IMU 模式：不打开串口、不等待云台姿态，世界系固定在初始相机系（假定云台静止）。
   bool imu_enabled{true};
+
+  // C 板 pitch/yaw 与四元数一起来；有 IMU 时直接用它们把相机系旋到重力水平系，
+  // 不再用「首帧相机系」当世界系。相机俯视安装时首帧系的 y 不是竖直方向，
+  // 四块板同一高度的模型会失效；水平化后 EKF 的 y 是真正的竖直轴（向下）。
+  // 无 IMU（--no-imu）时没有姿态可用，仍退回初始相机系。
+  // C 板 pitch 的正方向：抬头为正是 1；如果板卡把低头报成正，传 -1。
+  double level_pitch_sign{1.0};
+  // 相机相对云台的固定安装俯仰（度）。C 板 pitch 只报云台关节时，用它补上相机低头角。
+  double level_pitch_offset_deg{0.0};
 
   // 把每块装甲板的原始观测量（YPD）单独落盘，标定 R 用。
   bool log_observations{false};
@@ -184,7 +197,10 @@ struct AppConfig {
   // 每 50 帧打印一次各阶段平均耗时，排查性能瓶颈用。
   bool profile{false};
 
-  double target_max_distance{2.5};
+  // 回放时把画完检测框和四面装甲板重投影的画面 cvshow 到屏幕，边跑边看效果。
+  bool debug_draw{false};
+
+  double target_max_distance{4.0};
 };
 
 }  // namespace core

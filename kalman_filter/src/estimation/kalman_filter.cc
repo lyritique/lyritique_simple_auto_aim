@@ -2,6 +2,7 @@
 
 #include <Eigen/src/Core/Matrix.h>
 
+#include <algorithm>
 #include <cmath>
 #include <eigen3/Eigen/Eigen>
 #include <iostream>
@@ -73,7 +74,8 @@ Eigen::Matrix<double, 4, 11> computeH(const Eigen::Matrix<double, 11, 1>& X_, in
   return J;
 }
 
-Eigen::Matrix4d computeR(const KalmanConfig& config, const cam_ypd ypd, const Eigen::Matrix3d& R_C0C) {
+Eigen::Matrix4d computeR(const KalmanConfig& config, const cam_ypd ypd, const Eigen::Matrix3d& R_C0C,
+                         double cos_obliquity) {
   // 预计算
   const double s_e{std::sin(ypd.ele)};
   const double c_e{std::cos(ypd.ele)};
@@ -95,9 +97,16 @@ Eigen::Matrix4d computeR(const KalmanConfig& config, const cam_ypd ypd, const Ei
   // 深度噪声
   const double sigma_dist = config.k_dist * ypd.dist;
 
+  // 板越斜，法向的方位角越不可观：法向是从"板面正对相机"这个前提反解出来的，
+  // 斜视时同样的像素误差会被放大到 1/cos(斜视角) 倍，侧视时基本是随机数。
+  // 用 yaw_max 兜底而不是无限放大——位置那三行还要靠这块板把车心钉住。
+  const double yaw_lo = std::min(config.yaw, config.yaw_max);
+  const double yaw_hi = std::max(config.yaw, config.yaw_max);
+  const double sigma_yaw = std::clamp(config.yaw / std::clamp(cos_obliquity, 1e-3, 1.0), yaw_lo, yaw_hi);
+
   // 构造R_ypd，理论4*4，但对角，就写成向量吧
   Eigen::Matrix<double, 4, 1> R_ypd(config.azi * config.azi, config.ele * config.ele, sigma_dist * sigma_dist,
-                                    config.yaw * config.yaw);
+                                    sigma_yaw * sigma_yaw);
 
   // J 求出来的是相机系的协方差，而 measurement / H / P 都在世界系。
   // 位置那三行要跟着 R_C0C 转过去，不然深度噪声会被摆到错误的轴上。
@@ -284,7 +293,7 @@ void KalmanFilter::predict(const double& dt) {
   P = 0.5 * (P + P.transpose());
 }
 
-void KalmanFilter::update(armerState& armor, const cam_ypd& ypd, const Eigen::Matrix3d& R_C0C) {
+void KalmanFilter::update(armerState& armor, const cam_ypd& ypd, const Eigen::Matrix3d& R_C0C, double cos_obliquity) {
   /*
   //h(X_)部分写在匿名命名空间
   //计算残差
@@ -311,7 +320,7 @@ void KalmanFilter::update(armerState& armor, const cam_ypd& ypd, const Eigen::Ma
   const Eigen::Matrix<double, 11, 11> P_prior = P;
 
   // 判断armor的id，顺带算好H，nu（残差）,S^-1
-  Eigen::Matrix4d R{computeR(config, ypd, R_C0C)};
+  Eigen::Matrix4d R{computeR(config, ypd, R_C0C, cos_obliquity)};
   armor.testResult = associate(armor, id_list, X, P, config, R, max_id);
 
   // 检查是否过了匹配

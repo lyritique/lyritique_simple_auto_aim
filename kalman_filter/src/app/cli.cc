@@ -445,6 +445,69 @@ CliResult parseCommandLine(int argc, char** argv) {
       result.config.imu_enabled = false;
       continue;
     }
+    // 作用：C 板 pitch 的正方向，抬头为正是 1，低头报正就传 -1。实现：写 level_pitch_sign。
+    if (arg == "--level-pitch-sign") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseDouble(*value, result.config.level_pitch_sign)) {
+        result.error = "无效的 level pitch 符号: " + *value;
+        break;
+      }
+      continue;
+    }
+    // 作用：补相机相对云台的固定安装俯仰（度），C 板只报云台关节时用。实现：写 level_pitch_offset_deg。
+    if (arg == "--level-pitch-offset") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseDouble(*value, result.config.level_pitch_offset_deg)) {
+        result.error = "无效的 level pitch 偏移: " + *value;
+        break;
+      }
+      continue;
+    }
+    // 作用：调 EKF 的车心加速度噪声；转靶车时车心乱飘就往下调。实现：写 kalman.p_coord。
+    if (arg == "--p-coord") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseDouble(*value, result.config.kalman.p_coord)) {
+        result.error = "无效的 p_coord: " + *value;
+        break;
+      }
+      continue;
+    }
+    // 作用：调 EKF 的角加速度噪声；vyaw 乱跳/符号翻转就往下调。实现：写 kalman.p_yaw。
+    if (arg == "--p-yaw") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseDouble(*value, result.config.kalman.p_yaw)) {
+        result.error = "无效的 p_yaw: " + *value;
+        break;
+      }
+      continue;
+    }
+    // 作用：同时设方位/俯仰观测噪声（弧度），P(nP) 位置抖就调大。实现：azi=ele=ps。
+    if (arg == "--pos-noise") {
+      const auto* value = requireValue();
+      if (!value) break;
+      double noise{};
+      if (!parseDouble(*value, noise)) {
+        result.error = "无效的 pos-noise: " + *value;
+        break;
+      }
+      result.config.kalman.azi = noise;
+      result.config.kalman.ele = noise;
+      continue;
+    }
+    // 作用：设装甲板 yaw 观测噪声（弧度），单板旋转时 yaw 跟不上就调小。实现：写 kalman.yaw。
+    if (arg == "--yaw-noise") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (!parseDouble(*value, result.config.kalman.yaw)) {
+        result.error = "无效的 yaw-noise: " + *value;
+        break;
+      }
+      continue;
+    }
     // 作用：把原始观测量单独落盘，标定 R 用。实现：log_observations 置真。
     if (arg == "--log-observations") {
       result.config.log_observations = true;
@@ -453,6 +516,11 @@ CliResult parseCommandLine(int argc, char** argv) {
     // 作用：打印各阶段耗时，判断该砍推理还是砍后处理。实现：profile 置真。
     if (arg == "--profile") {
       result.config.profile = true;
+      continue;
+    }
+    // 作用：把画好重投影的帧显示到屏幕，肉眼检查位姿。实现：debug_draw 置真。
+    if (arg == "--debug-draw") {
+      result.config.debug_draw = true;
       continue;
     }
     // 作用：选推理后端，现场缺 TensorRT 时可切 CUDA 或 CPU。实现：只认四个值，其余报错。
@@ -575,8 +643,11 @@ void printUsage(std::ostream& out) {
          "  --camera-calib-seconds S  设备时钟校准窗口，标定 ns/tick 时给几百秒\n"
          "  --camera-tick-ns NS   每 tick 纳秒数，默认 10（相机 100 MHz），不用改\n"
          "  --no-imu              不用 C 板姿态，假定云台静止（串口可不接）\n"
+         "  --level-pitch-sign F  C 板 pitch 正方向，抬头为正是 1，低头报正传 -1\n"
+         "  --level-pitch-offset DEG  相机相对云台的固定安装俯仰，度\n"
          "  --log-observations    把每块装甲板的原始观测量写入 observations.csv\n"
          "  --profile             每 50 帧打印一次各阶段平均耗时\n"
+         "  --debug-draw          回放时 cvshow 带检测框和重投影的画面\n"
          "  --score-threshold F   检测置信度阈值，默认 0.5；现场目标小/暗时往低调\n"
          "  --detector-backend B  auto / trt / cuda / cpu，默认 auto（TensorRT→CUDA→CPU）\n"
          "  --no-fp16             关闭 TensorRT FP16\n"
@@ -586,6 +657,10 @@ void printUsage(std::ostream& out) {
          "  --baud N              串口波特率\n"
          "  --comm-latency S      通信延迟估计，秒\n"
          "  --max-distance M      送入 EKF 的最大目标距离\n"
+         "  --p-coord F           车心加速度噪声，默认 10；车心乱飘往低调\n"
+         "  --p-yaw F             角加速度噪声，默认 50；vyaw 乱跳往低调\n"
+         "  --pos-noise F         方位/俯仰观测噪声（rad），默认 0.063\n"
+         "  --yaw-noise F         装甲板 yaw 观测噪声（rad），默认 0.2\n"
          "  --aim-debug           打印解算指令与 C 板自报姿态，判断坐标系约定\n"
          "  --send-control        真正把 VisionToGimbal 写进串口（默认只算不发）\n"
          "  --bullet-speed F      弹速兜底值，C 板没报时用，m/s\n"

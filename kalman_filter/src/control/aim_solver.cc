@@ -70,7 +70,7 @@ void AimSolver::reset() {
 
 AimSolution AimSolver::solve(const kalfilter::KFResult& state, const Eigen::Quaterniond& q_init,
                              const Eigen::Quaterniond& q_now, double latency_seconds, double bullet_speed,
-                             double now_seconds) {
+                             double now_seconds, const Eigen::Matrix3d* c0_to_world) {
   AimSolution solution;
   if (!state.valid) return solution;
 
@@ -96,19 +96,26 @@ AimSolution AimSolver::solve(const kalfilter::KFResult& state, const Eigen::Quat
   }
 
   // C0 -> C 板世界系。
-  // C0 = 首帧相机系；q_init 把它转回首帧的姿态，q_now^-1 再退到当前相机系，
-  // 换轴成体轴后用 q_now 转到世界系。三条连起来就是：q_now · M · p_cam。
+  // 默认：C0 = 首帧相机系，q_init 把它转回首帧的姿态，q_now^-1 再退到当前相机系，
+  //       换轴成体轴后用 q_now 转到世界系。三条连起来就是：q_now · M · p_cam。
+  // level：C0 已经是水平世界，直接乘 E→C 板世界系，不再经过相机姿态。
   Eigen::Vector3d point_world;
-  if (config_.cam_remap) {
+  if (c0_to_world != nullptr) {
+    point_world = (*c0_to_world) * point;
+  } else if (config_.cam_remap) {
     const Eigen::Vector3d point_camera = q_now.conjugate() * (q_init * point);
     point_world = q_now * (kCameraToBody * point_camera);
   } else {
     point_world = q_init * point;
   }
+
+  // c0_to_world 指向的 C 板世界系固定是 z 朝天；此时不要再按 --up-axis 换轴。
+  const bool z_up = (c0_to_world != nullptr) || config_.z_up;
+
   if (config_.compensate_drop) {
     // 沿世界系的竖轴抬高一点补偿下坠；未标定前别开。
     const double drop = 0.5 * config_.gravity * flight_time * flight_time;
-    if (config_.z_up) {
+    if (z_up) {
       point_world.z() += drop;
     } else {
       point_world.y() += drop;
@@ -120,7 +127,7 @@ AimSolution AimSolver::solve(const kalfilter::KFResult& state, const Eigen::Quat
   solution.point_c0 = point;
   solution.dir_world = dir;
   // 世界系约定：y 朝天时水平面是 x-z，z 朝天时是 x-y。yaw 一律取"水平面内绕竖轴的方位角"。
-  if (config_.z_up) {
+  if (z_up) {
     solution.yaw = config_.yaw_sign * std::atan2(dir.y(), dir.x()) + config_.yaw_offset;
     solution.pitch = config_.pitch_sign * std::asin(std::clamp(dir.z(), -1.0, 1.0)) + config_.pitch_offset;
   } else {

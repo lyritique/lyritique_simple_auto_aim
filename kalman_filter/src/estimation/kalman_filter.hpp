@@ -9,8 +9,11 @@ namespace kalfilter {
 
 struct KalmanConfig {
   // Q
-  double p_coord = 100;
-  double p_yaw = 400;
+  // 车心/角速度的加速度噪声。原来 100/400 相当于允许 ~10 m/s²、20 rad/s² 的随机加速度，
+  // 单板看旋转目标时位置和 yaw 会互相抢：滤波器宁愿平移车心也不转 yaw。
+  // 10/50 仍能跟住机动，但把车心钉住得多。
+  double p_coord = 20;
+  double p_yaw = 50;
   double p_r{1e-6};
   // Δr/Δz 只在 id 奇偶切换时才被约束，可观测性弱，噪声给得远小于位置速度，
   // 相当于强先验：允许缓慢修正，不许乱跑。
@@ -19,10 +22,14 @@ struct KalmanConfig {
 
   // R
   // yac对角噪声
-  double ele{0.032};
-  double azi{0.032};
+  double ele{0.063};
+  double azi{0.063};
   double k_dist{0.05};
-  double yaw{0.2};
+  double yaw{0.3};
+  // 板子斜视时法向方位角的误差按 1/cos(斜视角) 放大，这是放大后的上限。
+  // 10 rad/s 目标的大部分时间都只有一块快立起来的板在画面里，它的 yaw 基本是随机数；
+  // 但也不能放大到无穷，位置那三行还要靠它把车心钉住。
+  double yaw_max{0.6};
 
   double assoc_pos_gate{2.5};
   double max_yaw_innovation{0.7853981633974483};  // 45 度
@@ -88,7 +95,8 @@ class KalmanFilter {
   void reset();
   void predict(const double& dt);
   // R_C0C 把观测噪声从相机系转到世界系，必须和 measurement 用同一个旋转。
-  void update(armerState& armor, const cam_ypd& ypd, const Eigen::Matrix3d& R_C0C);
+  // cos_obliquity = |板法向 · 指向相机的视线|，正对为 1；只用来放大 yaw 那一行的噪声。
+  void update(armerState& armor, const cam_ypd& ypd, const Eigen::Matrix3d& R_C0C, double cos_obliquity = 1.0);
   // 这个是每一帧的结束处理id_list的
   void renewArmorList();
   KFResult getOutput() const;

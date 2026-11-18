@@ -51,6 +51,27 @@ std::array<cv::Point2f, 4> refineArmorCorners(const cv::Mat& gray, const std::ar
   return result;
 }
 
+// 作用：用投影轮廓估这块板有多正对相机，正对返回 1，侧视趋于 0。
+// 实现：矩形面积 A 除以最长边的平方，等于投影宽/高；正对时它就是板子的真实宽高比，
+// 斜视时按 cos(斜视角) 缩小。除以真实宽高比归一化后，就是 cos(斜视角)。
+// 纯图像量，不依赖 PnP——斜视板的 PnP 法向本身就不靠谱，不能拿它判断斜不斜。
+double frontalRatio(const std::array<cv::Point2f, 4>& corners, bool big) {
+  double twice_area = 0.0;
+  double longest = 0.0;
+  for (std::size_t i = 0; i < corners.size(); ++i) {
+    const cv::Point2f& a = corners[i];
+    const cv::Point2f& b = corners[(i + 1) % corners.size()];
+    twice_area += static_cast<double>(a.x) * b.y - static_cast<double>(b.x) * a.y;
+    longest = std::max(longest, static_cast<double>(cv::norm(b - a)));
+  }
+  if (!(longest > 1e-6)) return 0.0;
+
+  const double aspect = big ? pnp::pnpConfig::half_big_width / pnp::pnpConfig::half_big_height
+                            : pnp::pnpConfig::half_small_width / pnp::pnpConfig::half_small_height;
+  const double projected = 0.5 * std::abs(twice_area) / (longest * longest);
+  return std::clamp(projected / aspect, 0.0, 1.0);
+}
+
 }  // namespace
 
 // 作用：按配置把处理器组装起来，顺便存下距离阈值。实现：初始化列表构造检测器，其余成员就地默认构造。
@@ -60,7 +81,8 @@ FrameProcessor::FrameProcessor(const core::AppConfig& config)
       target_max_distance_(config.target_max_distance),
       profile_(config.profile),
       detector_(detector_config_),
-      pnp_(intrinsics_) {}
+      pnp_(intrinsics_),
+      ekf_(config.kalman) {}
 
 // 作用：重置滤波器和帧时间记忆，开始新一段视频。实现：ekf_.reset() 加标志位归零。
 void FrameProcessor::reset() {
@@ -179,7 +201,8 @@ FrameProcessingResult FrameProcessor::solve(const core::TimestampedFrame& frame,
     }
 
     // 作用：已初始化就正常更新，只拿一块板子更新一次，避免同帧重复喂。实现：update 后打个空行当调试分隔。
-    ekf_.update(ekf_input, ypd, R_C0C);
+    // 第四参传这块板的正对程度，斜视板的法向方位角误差按 1/cos 放大（见 computeR）。
+    ekf_.update(ekf_input, ypd, R_C0C, frontalRatio(refined, detection.big));
   }
 
   // 作用：把初始化状态汇报出去，外部据此判断要不要信任结果。实现：拷贝成员标志。

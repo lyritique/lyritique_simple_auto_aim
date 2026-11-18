@@ -69,8 +69,11 @@ class AimSolver {
   //      now_seconds —— 上位机单调时钟，只用于差分出角速度。
   // 返回：解算结果；state 无效时 valid=false。
   // q_init / q_now —— 首帧和当前帧的相机姿态（相机系 -> C 板世界系）。
+  // c0_to_world —— 非空时表示 EKF 状态已经在水平世界 C0 里，直接用这个矩阵转到 C 板世界系，
+  //                不再走 q_init/q_now 的相机系换算（对应有 IMU 的实时模式）。
   AimSolution solve(const kalfilter::KFResult& state, const Eigen::Quaterniond& q_init,
-                    const Eigen::Quaterniond& q_now, double latency_seconds, double bullet_speed, double now_seconds);
+                    const Eigen::Quaterniond& q_now, double latency_seconds, double bullet_speed, double now_seconds,
+                    const Eigen::Matrix3d* c0_to_world = nullptr);
 
   // 换目标或重连时清掉差分历史，免得拿上一条指令算出一个假的角速度。
   void reset();

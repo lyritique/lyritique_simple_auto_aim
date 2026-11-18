@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -30,6 +31,42 @@ void logAttitudeConvention(const kalfilter::GimbalSample& attitude) {
   std::clog << "board yaw=" << attitude.yaw * kRad2Deg << "° pitch=" << attitude.pitch * kRad2Deg
             << "° | 体轴+x az=" << std::atan2(axis.y(), axis.x()) * kRad2Deg << "° el="
             << std::asin(std::clamp(axis.z(), -1.0, 1.0)) * kRad2Deg << "°";
+}
+
+// C 板世界系（x 前、y 左、z 上）-> EKF 水平世界 E（x 右、y 下、z 前）。
+// E 的 y 是真正的竖直方向，四块装甲板「同一高度」的模型才成立。
+Eigen::Matrix3d levelToBoardWorld() {
+  Eigen::Matrix3d R;
+  R << 1.0, 0.0, 0.0,   // E.x = W.x
+      0.0, 0.0, 1.0,    // E.y = -W.z（向下）
+      0.0, -1.0, 0.0;   // E.z = W.y
+  return R;
+}
+
+// 用 C 板的 pitch/yaw 构造「相机系 -> 水平世界 E」的旋转。
+// 约定（与 logAttitudeConvention / --up-axis z 一致）：
+//   光轴在 C 板世界系里是 (cos p cos y, cos p sin y, sin p)，pitch 抬头为正。
+// 只靠光轴方向定两个自由度，假设相机没有 roll（两轴云台）。
+Eigen::Matrix3d cameraToLevelWorld(double pitch, double yaw) {
+  const Eigen::Vector3d axis(std::cos(pitch) * std::cos(yaw), std::cos(pitch) * std::sin(yaw), std::sin(pitch));
+
+  const Eigen::Vector3d world_down(0.0, 0.0, -1.0);
+  Eigen::Vector3d down = world_down - world_down.dot(axis) * axis;
+  if (down.norm() < 1e-6) {
+    // 光轴正对天/地，roll 不可观测，退化为单位阵，至少不产生 NaN。
+    return Eigen::Matrix3d::Identity();
+  }
+  down.normalize();
+
+  // 相机系：x 右、y 下、z 前；x = y × z。
+  const Eigen::Vector3d right = down.cross(axis);
+
+  Eigen::Matrix3d R_WC;
+  R_WC.col(0) = right;
+  R_WC.col(1) = down;
+  R_WC.col(2) = axis;
+
+  return levelToBoardWorld().transpose() * R_WC;
 }
 
 }  // namespace
@@ -72,6 +109,7 @@ bool RealtimePipeline::start(std::string* error) {
   processor_.reset();
   has_q_init_ = false;
   q_init_.setIdentity();
+  has_level_log_ = false;
   last_feedback_receive_time_.store(0.0);
   aim_.reset();
   last_aim_log_time_ = -1.0;
@@ -320,15 +358,38 @@ PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame&
   }
 
   // 作用：第一次成功拿到姿态就把它当世界系基准。实现：没初始化过就存 q_init_ 并置标志。
+  // 注意：有 IMU 时世界是水平系，q_init_ 只保留给无 IMU 路径和瞄准兜底。
   if (!has_q_init_) {
     q_init_ = attitude.q;
     has_q_init_ = true;
   }
 
-  // 作用：算从初始姿态到当前姿态的相对旋转，算法世界 C0 就建立在这上面。实现：共轭乘当前姿态再单位化。
-  const Eigen::Quaterniond q_relative = (q_init_.conjugate() * attitude.q).normalized();
-  // 作用：把四元数变成旋转矩阵，PnP 结果转世界系要用。实现：toRotationMatrix。
-  const Eigen::Matrix3d R_C0C = q_relative.toRotationMatrix();
+  // 作用：算相机系到算法世界的旋转。实现：有 IMU 时用 C 板 pitch/yaw 把相机系直接转到
+  // 重力水平系；没有 IMU 时退回相对首帧相机系（世界跟着相机一起歪）。
+  Eigen::Matrix3d R_C0C;
+  if (config_.imu_enabled) {
+    constexpr double kDeg2Rad = 0.017453292519943295;
+    const double pitch =
+        attitude.pitch * config_.level_pitch_sign + config_.level_pitch_offset_deg * kDeg2Rad;
+    R_C0C = cameraToLevelWorld(pitch, attitude.yaw);
+    if (!has_level_log_) {
+      has_level_log_ = true;
+      const Eigen::Vector3d q_axis = attitude.q * Eigen::Vector3d::UnitX();
+      const Eigen::Vector3d py_axis(std::cos(pitch) * std::cos(attitude.yaw), std::cos(pitch) * std::sin(attitude.yaw),
+                                    std::sin(pitch));
+      std::clog << std::fixed << std::setprecision(2) << "[level] 板 yaw=" << attitude.yaw * kRad2Deg
+                << "° pitch=" << attitude.pitch * kRad2Deg << "° (sign=" << config_.level_pitch_sign
+                << ", offset=" << config_.level_pitch_offset_deg << "°)"
+                << " | q+x az=" << std::atan2(q_axis.y(), q_axis.x()) * kRad2Deg
+                << "° el=" << std::asin(std::clamp(q_axis.z(), -1.0, 1.0)) * kRad2Deg << "°"
+                << " | pitch/yaw 光轴=(" << py_axis.x() << "," << py_axis.y() << "," << py_axis.z() << ")\n";
+    }
+  } else {
+    // 作用：算从初始姿态到当前姿态的相对旋转，算法世界 C0 就建立在这上面。实现：共轭乘当前姿态再单位化。
+    const Eigen::Quaterniond q_relative = (q_init_.conjugate() * attitude.q).normalized();
+    // 作用：把四元数变成旋转矩阵，PnP 结果转世界系要用。实现：toRotationMatrix。
+    R_C0C = q_relative.toRotationMatrix();
+  }
 
   // 作用：把帧、检测结果和旋转交给下游处理器，走细化、PnP、EKF。实现：一次 solve 调用全套。
   const FrameProcessingResult processing = processor_.solve(frame, detections, R_C0C);
@@ -411,8 +472,12 @@ void RealtimePipeline::issueCommand(const core::TimestampedFrame& frame, const k
   // 作用：预测到指令生效时刻，超前量 = 本帧已花的处理时间 + 通信延迟，飞行时间在解算里迭代出来。
   const double latency = (command_ready_time - frame.timestamp) + config_.serial.communication_latency;
 
+  // 有 IMU 时 EKF 状态在水平世界 E 里，瞄准点直接乘 E→C 板世界系，不再走 q_init/q_now。
+  const Eigen::Matrix3d R_E_to_board = levelToBoardWorld();
+
   const control::AimSolution solution =
-      aim_.solve(state, q_init_, attitude.q, latency, attitude.bullet_speed, command_ready_time);
+      aim_.solve(state, q_init_, attitude.q, latency, attitude.bullet_speed, command_ready_time,
+                 config_.imu_enabled ? &R_E_to_board : nullptr);
 
   // 作用：限流打印，0.5 s 一行。实现：第一次无条件打，之后隔 0.5 s。
   const bool log_due = config_.control.debug_log &&

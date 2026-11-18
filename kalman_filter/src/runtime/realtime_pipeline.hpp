@@ -49,6 +49,8 @@ struct PipelineFrameResult {
   bool feedback_available{};
   // 作用：EKF 状态能不能信。实现：透传 processing.state_valid。
   bool state_valid{};
+  // 作用：本帧画图 + imshow 的耗时，毫秒；没开 debug_draw 时为 0。实现：画图前后取 steady 时钟差值。
+  double draw_ms{};
 
   // 作用：EKF 的最终状态整包。实现：直接拷贝 processing.state。
   kalfilter::KFResult state;
@@ -194,6 +196,8 @@ class RealtimePipeline {
 
   // 作用：记住第一帧的姿态有没有存过，决定 q_init_ 要不要初始化。实现：bool 门禁。
   bool has_q_init_{};
+  // 作用：有 IMU 时首帧打印一次板卡姿态和两种光轴，确认 pitch/yaw 约定。实现：bool 门禁。
+  bool has_level_log_{};
   // 作用：作为世界系基准的初始姿态，之后都用它算相对旋转。实现：Eigen 四元数，首帧赋值。
   Eigen::Quaterniond q_init_{Eigen::Quaterniond::Identity()};
 

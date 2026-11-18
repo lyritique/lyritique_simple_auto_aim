@@ -38,6 +38,15 @@ std::string hexCode(int code) {
 // 窗口太短的话斜率误差会变成每秒几毫秒的漂移。
 constexpr int kFrameCalibFrames = 100;
 
+// SDK 默认只给 1 个输出节点：处理稍慢一点，新帧就被挤掉，排空也就无从谈起。
+// 4 个够吸收一两帧的抖动，多了反而把延迟攒起来。
+constexpr unsigned int kImageNodeNum = 4;
+
+// 排空时每次最多等 1 ms。0 超时在不少 MVS 版本上直接返回 NODATA（或参数错误），
+// 结果就是"排空"从来没真正生效，旧帧一帧一帧地排到 EKF 面前 —— 延迟无限累积。
+constexpr unsigned int kDrainTimeoutMs = 1;
+constexpr int kMaxDrainFrames = 8;
+
 // 设备信息里的 char[] 不保证带 '\0'，按长度找零再截断。
 std::string fixedString(const unsigned char* data, std::size_t size) {
   const auto* text = reinterpret_cast<const char*>(data);
@@ -297,6 +306,20 @@ bool MvsCamera::open(std::string* error) {
     MV_CC_SetBoolValue(handle_, "ChunkModeActive", false);
   }
 
+  // 开闸之前先把输出节点数和取流策略都设好。
+  // 默认策略是 OneByOne（从旧到新一帧一帧给），只要处理比相机慢一点点，
+  // 队列就会越攒越长，取到手的永远是几秒前的图 —— 这是"滞后一路涨到 1 秒"的根因。
+  // LatestImagesOnly 由 SDK 直接清掉旧帧、只交最新的一帧，延迟不会累积（慢了就丢帧）。
+  if (MV_CC_SetImageNodeNum(handle_, kImageNodeNum) != MV_OK) {
+    std::clog << "提示: 设置图像节点数 " << kImageNodeNum << " 失败，沿用 SDK 默认值\n";
+  }
+
+  const int strategy_ret = MV_CC_SetGrabStrategy(handle_, MV_GrabStrategy_LatestImagesOnly);
+  grab_latest_only_ = strategy_ret == MV_OK;
+  if (!grab_latest_only_) {
+    std::clog << "提示: 设置取流策略 LatestImagesOnly 失败（" << hexCode(strategy_ret) << "），退回手动排空\n";
+  }
+
   // 开闸，开始出图
   ret = MV_CC_StartGrabbing(handle_);
   if (ret != MV_OK) {
@@ -358,13 +381,25 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
 
   // 拿到一帧之后再看队列里还有没有更新的：SDK 是先进先出，积压时手里这张
   // 可能是几秒前的旧图。只留最新的一张，中间的丢掉，否则延迟会无上限累积。
-  // 用 0 超时不阻塞，取到 NODATA/TIMEOUT 就说明追平了。
+  // 靠 LatestImagesOnly 策略时 SDK 已经清过队列，这里不用再抽；
+  // 策略没设上才手动排空，而且必须给 1 ms 超时 —— 0 超时可能直接返回 NODATA。
   int stale = 0;
-  for (; stale < 16; ++stale) {
-    MV_FRAME_OUT newer{};
-    if (MV_CC_GetImageBuffer(handle_, &newer, 0) != MV_OK) break;
-    MV_CC_FreeImageBuffer(handle_, &raw);
-    raw = newer;
+  if (!grab_latest_only_) {
+    for (; stale < kMaxDrainFrames; ++stale) {
+      MV_FRAME_OUT newer{};
+      const int drain_ret = MV_CC_GetImageBuffer(handle_, &newer, kDrainTimeoutMs);
+      if (drain_ret != MV_OK) {
+        // 只报一次：从这条错误码就能看出是轮询没等到帧（NODATA/TIMEOUT），
+        // 还是超时值本身不被接受。
+        if (!drain_probe_logged_) {
+          drain_probe_logged_ = true;
+          std::clog << "[相机] 排空探测结束于 " << hexCode(drain_ret) << "（已排空 " << stale << " 帧）\n";
+        }
+        break;
+      }
+      MV_CC_FreeImageBuffer(handle_, &raw);
+      raw = newer;
+    }
   }
 
   // 收帧时刻只当兜底：设备时钟校准成功后，会用相机自己的戳。
@@ -372,8 +407,9 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
 
   if (stale > 0) {
     stale_dropped_ += static_cast<uint64_t>(stale);
-    // 每跳 200 帧提示一次，说明处理跟不上相机产出。
-    if (stale_dropped_ % 200 < static_cast<uint64_t>(stale)) {
+    // 第一次无条件报告（能立刻判断排空是否生效），之后每 200 帧提示一次。
+    if (stale_dropped_ == static_cast<uint64_t>(stale) ||
+        stale_dropped_ % 200 < static_cast<uint64_t>(stale)) {
       std::clog << "[相机] 已跳过 " << stale_dropped_ << " 帧旧图（处理跟不上，只保留最新帧）\n";
     }
   }
@@ -622,6 +658,7 @@ void MvsCamera::close() {
   chunk_active_ = false;
   chunk_bits_per_pixel_ = 0;
   clock_ready_ = false;
+  grab_latest_only_ = false;
   clock_offset_ = 0.0;
   clock_spread_ms_ = 0.0;
   calib_frames_left_ = 0;
