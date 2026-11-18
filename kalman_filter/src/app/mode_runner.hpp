@@ -1,10 +1,9 @@
-# ifndef AUTOAIM_APP_MODE_RUNNER_HPP
-# define AUTOAIM_APP_MODE_RUNNER_HPP
+#ifndef AUTOAIM_APP_MODE_RUNNER_HPP
+#define AUTOAIM_APP_MODE_RUNNER_HPP
 
-# include "core/config.hpp"
+#include "core/config.hpp"
 
-namespace app
-{
+namespace app {
 
 // 作用：跑离线回放，把视频和 IMU 喂给算法并输出结果。实现：构造 ReplayPipeline 后一路 run，失败打印错误。
 // 参数：config —— 已经解析好的配置。返回：进程退出码，0 成功、1 失败。
@@ -18,6 +17,6 @@ int runLive(const core::AppConfig& config);
 // 参数：无。返回：进程退出码，0 表示枚举成功（哪怕一台没有），1 表示枚举出错。
 int listCameras();
 
-}   // namespace app
+}  // namespace app
 
-# endif
+#endif
