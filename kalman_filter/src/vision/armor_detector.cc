@@ -219,8 +219,12 @@ Detector::Detector(const DetectorConfig& config) : config_(config) {
   throw std::runtime_error("Detector: 没有可用的推理后端；最后一次错误: " + last_error);
 }
 
-Detector::Blob Detector::makeBlob(const cv::Mat& bgr) const {
-  Blob input;  // 没人觉得在这个函数了应该叫output吗
+Detector::Blob Detector::preprocess(const cv::Mat& bgr) const {
+  Blob input;
+  if (bgr.empty()) return input;
+  if (bgr.type() != CV_8UC3) {
+    throw std::invalid_argument("Detector::detect 需要 CV_8UC3 的 BGR 图像");
+  }
 
   // 宽、高方向各算一个缩放比例，取较小的那个，不用头脑风暴长宽比比较
   const float scale_x = static_cast<float>(config_.input_width) / bgr.cols;
@@ -279,43 +283,16 @@ ArmorDetections Detector::detect(const cv::Mat& bgr) {
   ArmorDetections detections;
   if (bgr.empty()) return detections;
 
-  if (bgr.type() != CV_8UC3) {
-    throw std::invalid_argument("Detector::detect 需要 CV_8UC3 的 BGR 图像");
-  }
-
   // 三段计时：预处理、推理、后处理。加起来就是单帧检测的净开销。
   const auto stage_start = std::chrono::steady_clock::now();
-  Blob input = makeBlob(bgr);
+  Blob input = preprocess(bgr);
   if (input.blob.empty() || input.info.scale <= 0.0f) return detections;
   const auto preprocess_done = std::chrono::steady_clock::now();
 
-  std::vector<Ort::Value> outputs;
-  try {
-    Ort::Value input_tensor =
-        Ort::Value::CreateTensor<float>(memory_info_, input.blob.ptr<float>(), input.blob.total(), input_shape_, 4);
-    outputs = session_->Run(Ort::RunOptions{nullptr}, input_names_.data(), &input_tensor, 1, output_names_.data(), 1);
-  } catch (const Ort::Exception& error) {
-    throw std::runtime_error(std::string("Detector: YOLO 前向推理失败: ") + error.what());
-  }
+  Outputs outputs = infer(input);
   const auto inference_done = std::chrono::steady_clock::now();
 
-  if (outputs.empty()) {
-    throw std::runtime_error("Detector: 推理没有返回输出");
-  }
-
-  // 输出 [1,21,6300] 是连续的 float，包成无拷贝的 cv::Mat 头交给 decode。
-  // outputs 必须活到 decode 结束；这里保持在函数作用域内即可。
-  Ort::Value& output_tensor = outputs.front();
-  const std::vector<std::int64_t> output_shape = output_tensor.GetTensorTypeAndShapeInfo().GetShape();
-  if (output_shape.size() != 3) {
-    throw std::runtime_error("Detector: 模型输出不是 3 维张量");
-  }
-  const int dims[3] = {static_cast<int>(output_shape[0]), static_cast<int>(output_shape[1]),
-                       static_cast<int>(output_shape[2])};
-  cv::Mat output(3, dims, CV_32F, output_tensor.GetTensorMutableData<float>());
-
-  decode(output, input, bgr.cols, bgr.rows, detections);
-  nms(detections, config_.nms_threshold);
+  postprocess(outputs, input, bgr.cols, bgr.rows, detections);
   const auto postprocess_done = std::chrono::steady_clock::now();
 
   const auto to_ms = [](const auto& a, const auto& b) {
@@ -326,6 +303,50 @@ ArmorDetections Detector::detect(const cv::Mat& bgr) {
   timings_.postprocess_ms = to_ms(inference_done, postprocess_done);
 
   return detections;
+}
+
+Detector::Outputs Detector::infer(const Blob& input) {
+  if (input.blob.empty()) {
+    throw std::invalid_argument("Detector::infer 需要非空的预处理结果");
+  }
+
+  Outputs outputs;
+  try {
+    // ORT 的输入 API 只收非 const 指针，这里保证只读；Blob 由调用方持有到 Run 返回。
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+        memory_info_, const_cast<float*>(input.blob.ptr<float>()), input.blob.total(), input_shape_, 4);
+    outputs.values =
+        session_->Run(Ort::RunOptions{nullptr}, input_names_.data(), &input_tensor, 1, output_names_.data(), 1);
+  } catch (const Ort::Exception& error) {
+    throw std::runtime_error(std::string("Detector: YOLO 前向推理失败: ") + error.what());
+  }
+
+  if (outputs.values.empty()) {
+    throw std::runtime_error("Detector: 推理没有返回输出");
+  }
+  return outputs;
+}
+
+void Detector::postprocess(const Outputs& outputs, const Blob& input, int image_width, int image_height,
+                           ArmorDetections& detections) const {
+  detections.clear();
+  if (outputs.values.empty()) {
+    throw std::runtime_error("Detector: 推理没有返回输出");
+  }
+
+  // 输出 [1,21,6300] 是连续的 float，包成无拷贝的 cv::Mat 头交给 decode。
+  // Outputs 必须活到本函数返回；decode 只读，const_cast 只是给 cv::Mat 一个非 const 头。
+  const Ort::Value& output_tensor = outputs.values.front();
+  const std::vector<std::int64_t> output_shape = output_tensor.GetTensorTypeAndShapeInfo().GetShape();
+  if (output_shape.size() != 3) {
+    throw std::runtime_error("Detector: 模型输出不是 3 维张量");
+  }
+  const int dims[3] = {static_cast<int>(output_shape[0]), static_cast<int>(output_shape[1]),
+                       static_cast<int>(output_shape[2])};
+  cv::Mat output(3, dims, CV_32F, const_cast<float*>(output_tensor.GetTensorData<float>()));
+
+  decode(output, input, image_width, image_height, detections);
+  nms(detections, config_.nms_threshold);
 }
 
 void Detector::decode(const cv::Mat& output, const Blob& input, int image_width, int image_height,

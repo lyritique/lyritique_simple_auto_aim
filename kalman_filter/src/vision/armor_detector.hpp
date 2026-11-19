@@ -69,21 +69,33 @@ class Detector {
   // 综合
   ArmorDetections detect(const cv::Mat& bgr);
 
-  const DetectorConfig& config() const noexcept { return config_; }
-
-  // 最近一次 detect 的分段耗时，只在启用 profiling 时打印。
-  const DetectTimings& timings() const noexcept { return timings_; }
-
- private:
   // letterbox 之后的网络输入，同时保存后处理需要的反变换参数
   struct Blob {
     cv::Mat blob;  // NCHW：1x3xHxW，CV_32F，值域 0~1
     LetterboxInfo info;
   };
 
-  // BGR -> letterbox  -> blob
-  Blob makeBlob(const cv::Mat& bgr) const;
+  // 一次推理的输出。Ort::Value 自己持有张量内存，
+  // 所以 Outputs 必须活到 postprocess 结束；这里不拷贝输出。
+  struct Outputs {
+    std::vector<Ort::Value> values;
+  };
 
+  // 三段式接口：detect() 只是按顺序组合它们，方便后续把推理放到独立线程。
+  // 预处理：BGR -> letterbox -> NCHW float blob。空图返回空 Blob，非 CV_8UC3 抛异常。
+  Blob preprocess(const cv::Mat& bgr) const;
+  // 推理：吃 Blob，吐 ORT 输出。失败统一转成 runtime_error。
+  Outputs infer(const Blob& input);
+  // 后处理：输出张量 -> 装甲板列表。detections 会被整体替换。
+  void postprocess(const Outputs& outputs, const Blob& input, int image_width, int image_height,
+                   ArmorDetections& detections) const;
+
+  const DetectorConfig& config() const noexcept { return config_; }
+
+  // 最近一次 detect 的分段耗时，只在启用 profiling 时打印。
+  const DetectTimings& timings() const noexcept { return timings_; }
+
+ private:
   // 把输出解码
   void decode(const cv::Mat& output, const Blob& input, int image_width, int image_height,
               ArmorDetections& detections) const;
