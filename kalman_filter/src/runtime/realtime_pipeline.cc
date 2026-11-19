@@ -135,6 +135,10 @@ bool RealtimePipeline::start(std::string* error) {
                       serial_.lastError(),
                   error);
     }
+    // P0：64 B/帧、8N1（每字节 10 bit）下的物理上限，控制频率不能拍脑袋定。
+    const int max_frame_hz = config_.serial.baud / (static_cast<int>(comm::kFrameSize) * 10);
+    std::clog << "[串口] " << config_.serial.device << " @" << config_.serial.baud << " 8N1，"
+              << comm::kFrameSize << " B/帧 => 理论上限 " << max_frame_hz << " 帧/s\n";
   }
 
   // 作用：按配置造出具体相机（实时是 MVS）。实现：make_unique 后调 open，失败就把刚开的串口也关掉。
@@ -188,6 +192,14 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
   double prof_cycle = 0.0;
   int prof_frames = 0;
 
+  // P0：processFrame 内部的细分耗时，和 prof_process 一起每 50 帧打一行。
+  double prof_wait = 0.0;
+  double prof_detect = 0.0;
+  double prof_pnp = 0.0;
+  double prof_ekf = 0.0;
+  double prof_aim = 0.0;
+  double prof_acq = 0.0;
+
   // 作用：画图耗时单独累计，别让 imshow 的等待混进 process 计时里。实现：单线程局部变量，够 50 帧打一行。
   double draw_total_ms = 0.0;
   int draw_frames = 0;
@@ -201,6 +213,8 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
     // 作用：向相机要一帧。实现：read 返回状态码，后续分支处理。
     const auto status = camera_->read(frame, &error);
     const auto read_done = std::chrono::steady_clock::now();
+    // P0：收帧时刻转成和全链路一致的秒数，用来算采集段延迟。
+    const double read_done_time = std::chrono::duration<double>(read_done.time_since_epoch()).count();
     // 作用：暂时没图不算错误，下一轮再要。实现：Timeout 就 continue，不计数。
     if (status == core::FrameReadStatus::Timeout) continue;
 
@@ -214,7 +228,7 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
     }
 
     // 作用：好帧就进入加工流水线。实现：直接调 processFrame，回调原样透传。
-    const PipelineFrameResult result = processFrame(frame, callback);
+    const PipelineFrameResult result = processFrame(frame, read_done_time, callback);
     const auto process_done = std::chrono::steady_clock::now();
 
     if (csv) {
@@ -254,11 +268,22 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
       prof_process += ms(read_done, process_done);
       prof_write += ms(process_done, write_done);
       prof_cycle += ms(cycle_start, write_done);
+      // P0：细分耗时直接从本帧结果拿，避免再埋一遍时钟。
+      prof_acq += (read_done_time - result.frame_time) * 1000.0;
+      prof_wait += result.attitude_wait_ms;
+      prof_detect += result.detect_ms;
+      prof_pnp += result.pnp_ms;
+      prof_ekf += result.ekf_ms;
+      prof_aim += result.aim_ms;
       if (++prof_frames >= 50) {
         const double n = static_cast<double>(prof_frames);
         std::clog << "[profile] cycle=" << prof_cycle / n << "ms  read=" << prof_read / n
                   << "ms  process=" << prof_process / n << "ms  write=" << prof_write / n << "ms\n";
+        std::clog << "[profile]   acq=" << prof_acq / n << "ms  wait=" << prof_wait / n
+                  << "ms  detect=" << prof_detect / n << "ms  pnp=" << prof_pnp / n
+                  << "ms  ekf=" << prof_ekf / n << "ms  aim=" << prof_aim / n << "ms\n";
         prof_read = prof_process = prof_write = prof_cycle = 0.0;
+        prof_acq = prof_wait = prof_detect = prof_pnp = prof_ekf = prof_aim = 0.0;
         prof_frames = 0;
       }
     }
@@ -322,7 +347,8 @@ PipelineStats RealtimePipeline::stats() const {
 }
 
 // 作用：把一帧从像素加工到滤波状态，是整条链路的正餐。实现：等姿态、算相对旋转、跑处理器、发布状态、记延迟、触发回调。
-PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame& frame, const FrameCallback& callback) {
+PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame& frame, double frame_received_time,
+                                                   const FrameCallback& callback) {
   // 作用：先备好结果容器，填上帧时间。实现：栈上默认构造后赋 timestamp。
   PipelineFrameResult result;
   result.frame_time = frame.timestamp;
@@ -339,6 +365,8 @@ PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame&
 
   // 作用：去历史里找这一帧时刻的云台姿态。实现：调 waitForAttitude，带超时等待。
   kalfilter::GimbalSample attitude;
+  // P0：这一段是纯等待，单列出来才知道 IMU 链路到底贡献了多少延迟。
+  const auto attitude_wait_start = std::chrono::steady_clock::now();
   // 作用：无 IMU 时用单位四元数顶替，世界系就等于初始相机系。实现：imu_enabled 为假才走这一支。
   if (!config_.imu_enabled) {
     attitude.host_time = frame.timestamp;
@@ -356,6 +384,8 @@ PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame&
     // 作用：姿态到手，标记本帧反馈可用。实现：置 true。
     result.feedback_available = true;
   }
+  result.attitude_wait_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - attitude_wait_start).count();
 
   // 作用：第一次成功拿到姿态就把它当世界系基准。实现：没初始化过就存 q_init_ 并置标志。
   // 注意：有 IMU 时世界是水平系，q_init_ 只保留给无 IMU 路径和瞄准兜底。
@@ -395,6 +425,11 @@ PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame&
   const FrameProcessingResult processing = processor_.solve(frame, detections, R_C0C);
   // 作用：把有效检测数、滤波状态、可信标志搬进对外结果。实现：逐字段赋值，检测数取 observations 大小。
   result.valid_detections = static_cast<int>(processing.observations.size());
+  // P0：把分段耗时透传给外部，profile 和延迟统计都靠它。
+  result.detect_ms = processing.detect_timings.preprocess_ms + processing.detect_timings.inference_ms +
+                     processing.detect_timings.postprocess_ms;
+  result.pnp_ms = processing.pnp_ms;
+  result.ekf_ms = processing.ekf_ms;
 
   // 作用：把原始观测原样留一份给外部落盘，标定 R 靠它。实现：逐条拷成轻量记录。
   for (const auto& observation : processing.observations) {
@@ -429,13 +464,20 @@ PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame&
   // 作用：凑一份打点交给延迟统计，目前只填了首尾和到达时间。实现：构造 FrameTiming 后调 recordFrame。
   kalfilter::FrameTiming timing;
   timing.exposure_time = frame.timestamp;
-  timing.frame_received_time = frame.timestamp;
+  // P0：收帧时刻用 read() 返回的真实时刻，之前填的是曝光时刻，采集段等于被抹平了。
+  timing.frame_received_time = frame_received_time;
+  timing.detection_done_time = processing.detect_done_time;
+  timing.pnp_done_time = processing.pnp_done_time;
+  timing.ekf_done_time = processing.ekf_done_time;
   timing.command_ready_time = command_ready_time;
   latency_.recordFrame(timing);
 
   // 作用：状态可信就解一条云台指令。实现：算不发也行，debug_log 打开时会打印出来给实测判断。
   if (config_.control.send || config_.control.debug_log) {
+    // P0：解算 + 串口写单独计时，串口阻塞会直接反映在这里。
+    const auto aim_start = std::chrono::steady_clock::now();
     issueCommand(frame, attitude, result.state, command_ready_time, result.valid_detections);
+    result.aim_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - aim_start).count();
   }
 
   // 作用：调试开关打开就把这一帧画出来并显示，窗口里的画面保持到下一帧刷新或链路停止。

@@ -15,6 +15,7 @@ int main() {
 
   const auto snapshot = latency.snapshot();
   const bool valid = snapshot.valid && std::abs(snapshot.process.median - 0.02) < 1e-9 &&
+                     std::abs(snapshot.process.p95 - 0.02) < 1e-9 &&
                      std::abs(snapshot.total_delay - 0.072) < 1e-9;
 
   if (!valid) {

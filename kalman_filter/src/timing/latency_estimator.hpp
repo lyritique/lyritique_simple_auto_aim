@@ -29,6 +29,8 @@ struct LatencyStats {
   double mean{};
   // 作用：中位数，抗毛刺的主力指标。实现：nth_element 取中间。
   double median{};
+  // 作用：95% 分位，比最大值更能代表“经常出现的坏情况”。实现：nth_element 取 95% 下标。
+  double p95{};
   // 作用：最大值，看最坏情况有多坏。实现：max_element 扫一遍。
   double maximum{};
 };

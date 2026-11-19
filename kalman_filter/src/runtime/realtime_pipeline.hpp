@@ -57,6 +57,17 @@ struct PipelineFrameResult {
 
   // 作用：本帧所有原始观测，标定 R 时用。实现：从 FrameObservation 逐条拷成轻量记录。
   std::vector<ObservationRecord> observations;
+
+  // P0 埋点：等云台姿态覆盖到帧时刻的耗时，毫秒；无 IMU 时为 0。
+  double attitude_wait_ms{};
+  // P0 埋点：检测器预处理 + 推理 + 后处理，毫秒。实现：三段相加。
+  double detect_ms{};
+  // P0 埋点：PnP（含亚像素细化和两版解算）累计耗时，毫秒。
+  double pnp_ms{};
+  // P0 埋点：EKF init/update 累计耗时，毫秒。
+  double ekf_ms{};
+  // P0 埋点：瞄准解算 + 串口下发耗时，毫秒。只在开了 send/debug_log 时统计。
+  double aim_ms{};
 };
 
 struct PipelineStats {
@@ -130,8 +141,10 @@ class RealtimePipeline {
 
  private:
   // 作用：一帧的完整加工：等姿态、算相对旋转、跑处理、记延迟、回调。实现：内部按顺序调用各组件，失败就计数返回。
-  // 参数：frame —— 已读出的帧；callback —— 外部回调，可空。返回：本帧结果，姿态等不到时各字段保持默认。
-  PipelineFrameResult processFrame(const core::TimestampedFrame& frame, const FrameCallback& callback);
+  // 参数：frame —— 已读出的帧；frame_received_time —— read() 返回时刻（steady 秒），P0 埋点用；
+  //      callback —— 外部回调，可空。返回：本帧结果，姿态等不到时各字段保持默认。
+  PipelineFrameResult processFrame(const core::TimestampedFrame& frame, double frame_received_time,
+                                   const FrameCallback& callback);
   // 作用：等云台历史覆盖到目标时刻，最多等配置的毫秒数。实现：循环尝试插值，睡 1ms 再试，超时或停机就放弃。
   // 参数：host_time —— 要查的时刻；sample —— 输出姿态。返回：true 拿到姿态，false 超时或链路已停。
   bool waitForAttitude(double host_time, kalfilter::GimbalSample& sample);
