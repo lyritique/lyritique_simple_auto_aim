@@ -87,6 +87,30 @@ set_target_properties(
 
 if(BUILD_TESTING)
     add_executable(
+        latest_slot_test
+        tests/latest_slot_test.cpp
+    )
+    target_include_directories(latest_slot_test PRIVATE src/)
+    target_link_libraries(latest_slot_test PRIVATE Threads::Threads)
+    add_test(
+        NAME latest_slot_test
+        COMMAND latest_slot_test
+    )
+    set_tests_properties(latest_slot_test PROPERTIES TIMEOUT 30)
+
+    add_executable(
+        bounded_queue_test
+        tests/bounded_queue_test.cpp
+    )
+    target_include_directories(bounded_queue_test PRIVATE src/)
+    target_link_libraries(bounded_queue_test PRIVATE Threads::Threads)
+    add_test(
+        NAME bounded_queue_test
+        COMMAND bounded_queue_test
+    )
+    set_tests_properties(bounded_queue_test PROPERTIES TIMEOUT 30)
+
+    add_executable(
         protocol_serial_test
         tests/protocol_serial_test.cpp
         src/transport/protocol.cc
