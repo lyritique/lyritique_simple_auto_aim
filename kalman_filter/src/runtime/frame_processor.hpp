@@ -58,6 +58,19 @@ struct FrameProcessingResult {
   double pnp_ms{};
   // P0 埋点：本帧所有板子的 EKF init/update 累计耗时，单位毫秒。
   double ekf_ms{};
+
+  // 作用：solve() 整体墙钟（含 predict），毫秒；和循环层的 process 对账。
+  double solve_ms{};
+  // 作用：帧首 EKF predict 耗时，毫秒；不并进 ekf_ms，避免重复计数。
+  double ekf_predict_ms{};
+  // 作用：BGR→GRAY cvtColor 耗时（含 gray 分配），毫秒。
+  double gray_ms{};
+  // 作用：所有检测框 cornerSubPix 细化累计耗时，毫秒；包含在 pnp_ms 里，单独列出便于拆账。
+  double refine_ms{};
+  // 作用：两版 PnP 解算累计耗时，毫秒；不含 refine，和 refine_ms 相加才是 pnp_ms 的主体。
+  double pnp_solve_ms{};
+  // 作用：renewArmorList + getOutput 耗时，毫秒；算在 solve 里但不属于 PnP/EKF 更新。
+  double renew_ms{};
 };
 
 class FrameProcessor {
@@ -110,10 +123,16 @@ class FrameProcessor {
   double profile_pre_{};
   double profile_inf_{};
   double profile_post_{};
-  double profile_rest_{};
+  double profile_solve_{};
   // P0：solve 内部再拆 PnP 和 EKF 两段，判断是该优化解算还是该查滤波器。
   double profile_pnp_{};
   double profile_ekf_{};
+  // solve 内部继续细拆，定位 19 ms 里剩下的墙钟。
+  double profile_predict_{};
+  double profile_gray_{};
+  double profile_refine_{};
+  double profile_pnp_solve_{};
+  double profile_renew_{};
 
   // 作用：真正干检测的工人。实现：构造时用 detector_config_ 初始化。
   detector::Detector detector_;

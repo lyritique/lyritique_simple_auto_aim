@@ -175,20 +175,22 @@ void RealtimePipeline::run(const std::atomic_bool& external_stop, FrameCallback 
 
 // 作用：同步内联路径，读帧、处理、落盘、画图都在当前线程。
 void RealtimePipeline::runSyncLoop(const std::atomic_bool& external_stop, const FrameCallback& callback) {
-  // 作用：分段计时累加器，把「等帧 / 处理 / 落盘」拆开看。实现：单线程局部变量，够 50 帧打一次。
+  // 作用：分段计时累加器，把「等帧 / 处理 / 落盘 / 画图 / 回调」拆开看。实现：单线程局部变量，够 50 帧打一行。
   double prof_read = 0.0;
   double prof_process = 0.0;
-  double prof_write = 0.0;
+  double prof_csv = 0.0;
+  double prof_draw = 0.0;
+  double prof_cb = 0.0;
   double prof_cycle = 0.0;
   int prof_frames = 0;
 
   // P0：processFrame 内部的细分耗时，和 prof_process 一起每 50 帧打一行。
   double prof_wait = 0.0;
   double prof_detect = 0.0;
-  double prof_pnp = 0.0;
-  double prof_ekf = 0.0;
+  double prof_solve = 0.0;
   double prof_aim = 0.0;
   double prof_acq = 0.0;
+  double prof_lat = 0.0;
 
   // 作用：画图耗时单独累计，别让 imshow 的等待混进 process 计时里。实现：单线程局部变量，够 50 帧打一行。
   double draw_total_ms = 0.0;
@@ -233,7 +235,9 @@ void RealtimePipeline::runSyncLoop(const std::atomic_bool& external_stop, const 
     const auto process_done = std::chrono::steady_clock::now();
 
     // 作用：同步路径下 CSV 由当前线程写，保证每帧一行。
+    const auto csv_start = std::chrono::steady_clock::now();
     writeCsv(result);
+    const auto csv_done = std::chrono::steady_clock::now();
 
     // 作用：开了调试画图就在这里画，画图耗时单独统计，不混进算法耗时。
     if (config_.debug_draw) {
@@ -247,35 +251,45 @@ void RealtimePipeline::runSyncLoop(const std::atomic_bool& external_stop, const 
     }
 
     // 作用：回调放在画图之后，和 P3 之前的顺序保持一致。
+    const auto cb_start = std::chrono::steady_clock::now();
     if (callback) callback(frame, result);
+    const auto cb_done = std::chrono::steady_clock::now();
 
-    // 作用：把这一轮的三段耗时记下来，够 50 帧就打成一行。
-    // 实现：read 里面含等帧，所以它大说明相机节流；process 大说明推理慢。
+    // 作用：把这一轮的耗时记下来，够 50 帧就打成一行。
+    // 实现：read 大说明相机节流；process 大说明算法慢；其余项逐段拆开，别再有黑洞。
     if (config_.profile) {
-      const auto write_done = std::chrono::steady_clock::now();
+      const auto cycle_done = std::chrono::steady_clock::now();
       const auto ms = [](const auto& a, const auto& b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
       };
       prof_read += ms(cycle_start, read_done);
       prof_process += ms(read_done, process_done);
-      prof_write += ms(process_done, write_done);
-      prof_cycle += ms(cycle_start, write_done);
+      prof_csv += ms(csv_start, csv_done);
+      prof_draw += result.draw_ms;
+      prof_cb += ms(cb_start, cb_done);
+      prof_cycle += ms(cycle_start, cycle_done);
       // P0：细分耗时直接从本帧结果拿，避免再埋一遍时钟。
       prof_acq += (read_done_time - result.frame_time) * 1000.0;
       prof_wait += result.attitude_wait_ms;
       prof_detect += result.detect_ms;
-      prof_pnp += result.pnp_ms;
-      prof_ekf += result.ekf_ms;
+      prof_solve += result.solve_ms;
       prof_aim += result.aim_ms;
+      prof_lat += result.process_latency * 1000.0;
       if (++prof_frames >= 50) {
         const double n = static_cast<double>(prof_frames);
-        std::clog << "[profile] cycle=" << prof_cycle / n << "ms  read=" << prof_read / n
-                  << "ms  process=" << prof_process / n << "ms  write=" << prof_write / n << "ms\n";
-        std::clog << "[profile]   acq=" << prof_acq / n << "ms  wait=" << prof_wait / n
-                  << "ms  detect=" << prof_detect / n << "ms  pnp=" << prof_pnp / n
-                  << "ms  ekf=" << prof_ekf / n << "ms  aim=" << prof_aim / n << "ms\n";
-        prof_read = prof_process = prof_write = prof_cycle = 0.0;
-        prof_acq = prof_wait = prof_detect = prof_pnp = prof_ekf = prof_aim = 0.0;
+        const double process_avg = prof_process / n;
+        const double process_other = std::max(
+            0.0, process_avg - (prof_detect + prof_wait + prof_solve + prof_aim) / n);
+        const double cycle_avg = prof_cycle / n;
+        const double cycle_other =
+            std::max(0.0, cycle_avg - (prof_read + prof_process + prof_csv + prof_draw + prof_cb) / n);
+        std::clog << "[profile] cycle=" << cycle_avg << "ms read=" << prof_read / n << " process=" << process_avg
+                  << " (detect " << prof_detect / n << " / att " << prof_wait / n << " / solve " << prof_solve / n
+                  << " / aim " << prof_aim / n << " / other " << process_other << ") csv=" << prof_csv / n
+                  << " draw=" << prof_draw / n << " cb=" << prof_cb / n << " other=" << cycle_other
+                  << " | acq=" << prof_acq / n << " lat=" << prof_lat / n << "ms\n";
+        prof_read = prof_process = prof_csv = prof_draw = prof_cb = prof_cycle = 0.0;
+        prof_acq = prof_wait = prof_detect = prof_solve = prof_aim = prof_lat = 0.0;
         prof_frames = 0;
       }
     }
@@ -304,9 +318,17 @@ void RealtimePipeline::runAsyncLoop(const std::atomic_bool& external_stop, Frame
 void RealtimePipeline::captureLoop(std::stop_token stop_token) {
   core::TimestampedFrame frame;
   uint64_t seq = 0;
+  double last_read_done = 0.0;
+
+  // capture 段自己的累计器：只在本线程读写，不加锁。
+  double prof_read = 0.0;
+  double prof_clone = 0.0;
+  double prof_period = 0.0;
+  int prof_frames = 0;
 
   while (running_.load() && !stop_token.stop_requested()) {
     std::string error;
+    const double read_start = steadyNowSeconds();
     const auto status = camera_->read(frame, &error);
     const double read_done_time = steadyNowSeconds();
 
@@ -328,18 +350,35 @@ void RealtimePipeline::captureLoop(std::stop_token stop_token) {
     }
 
     // 相机内部的 Mat 会被下一帧复用，进槽前必须变成独占 buffer。
+    const double clone_start = steadyNowSeconds();
     auto packet = std::make_shared<FramePacket>();
     packet->frame = frame;
     packet->frame.bgr = frame.bgr.clone();
+    const double clone_done = steadyNowSeconds();
     packet->seq = ++seq;
     packet->read_done_time = read_done_time;
-    packet->ready_time = steadyNowSeconds();
+    packet->ready_time = clone_done;
 
     {
       std::lock_guard<std::mutex> lock(stats_mutex_);
       ++stats_.captured_frames;
     }
     frame_slot_.publish(std::move(packet));
+
+    if (config_.profile) {
+      prof_read += (read_done_time - read_start) * 1000.0;
+      prof_clone += (clone_done - clone_start) * 1000.0;
+      const double period = last_read_done > 0.0 ? (read_done_time - last_read_done) * 1000.0 : 0.0;
+      prof_period += period;
+      if (++prof_frames >= 50) {
+        const double n = static_cast<double>(prof_frames);
+        std::clog << "[capture] read=" << prof_read / n << "ms clone=" << prof_clone / n << "ms period="
+                  << prof_period / n << "ms\n";
+        prof_read = prof_clone = prof_period = 0.0;
+        prof_frames = 0;
+      }
+    }
+    last_read_done = read_done_time;
   }
 }
 
@@ -350,15 +389,24 @@ void RealtimePipeline::perceptionLoop(std::stop_token stop_token) {
   uint64_t last_seq = 0;
   std::shared_ptr<const FramePacket> packet;
 
+  double prof_cycle = 0.0;
+  double prof_wait = 0.0;
+  double prof_process = 0.0;
+  double prof_csv = 0.0;
+  double prof_cb = 0.0;
   double prof_queue = 0.0;
   double prof_detect = 0.0;
-  double prof_pnp = 0.0;
-  double prof_ekf = 0.0;
+  double prof_att = 0.0;
+  double prof_solve = 0.0;
+  double prof_aim = 0.0;
   double prof_latency = 0.0;
   int prof_frames = 0;
+  double prev_cycle_start = -1.0;
 
   while (running_.load() && !stop_token.stop_requested()) {
+    const double cycle_start = steadyNowSeconds();
     if (!frame_slot_.waitNewer(seen, packet, stop_token)) break;
+    const double wait_done = steadyNowSeconds();
 
     // 槽是覆盖写，序号跳了说明中间有帧没来得及处理。
     if (packet->seq > last_seq + 1) {
@@ -368,29 +416,66 @@ void RealtimePipeline::perceptionLoop(std::stop_token stop_token) {
     }
     last_seq = packet->seq;
 
-    const double process_start = steadyNowSeconds();
+    const double process_start = wait_done;
     PipelineFrameResult result = processFrame(packet->frame, packet->read_done_time);
+    const double process_done = steadyNowSeconds();
     result.queue_wait_ms = (process_start - packet->ready_time) * 1000.0;
 
     // CSV 留在 perception，保证每个处理过的帧都有一行，方便和同步路径逐帧对比。
+    const double csv_start = steadyNowSeconds();
     writeCsv(result);
+    const double csv_done = steadyNowSeconds();
+
+    const double cb_start = steadyNowSeconds();
     if (config_.debug_draw) {
       debug_slot_.publish(DebugFrame{packet, result});
     }
     if (frame_callback_) frame_callback_(packet->frame, result);
+    const double cb_done = steadyNowSeconds();
+
+    // 姿态等待失败的帧很短，混进均值会把 process 拉低，profile 里直接跳过。
+    if (result.dropped) {
+      prev_cycle_start = cycle_start;
+      continue;
+    }
+
+    const double cycle_ms = prev_cycle_start >= 0.0 ? (cycle_start - prev_cycle_start) * 1000.0 : 0.0;
+    prev_cycle_start = cycle_start;
+    // 第一帧没有上一帧参照，cycle 记 0，不能参与均值。
+    if (cycle_ms <= 0.0) continue;
 
     if (config_.profile) {
+      const double wait_ms = (wait_done - cycle_start) * 1000.0;
+      const double process_ms = (process_done - process_start) * 1000.0;
+      const double csv_ms = (csv_done - csv_start) * 1000.0;
+      const double cb_ms = (cb_done - cb_start) * 1000.0;
+
+      prof_cycle += cycle_ms;
+      prof_wait += wait_ms;
+      prof_process += process_ms;
+      prof_csv += csv_ms;
+      prof_cb += cb_ms;
       prof_queue += result.queue_wait_ms;
       prof_detect += result.detect_ms;
-      prof_pnp += result.pnp_ms;
-      prof_ekf += result.ekf_ms;
+      prof_att += result.attitude_wait_ms;
+      prof_solve += result.solve_ms;
+      prof_aim += result.aim_ms;
       prof_latency += result.process_latency * 1000.0;
       if (++prof_frames >= 50) {
         const double n = static_cast<double>(prof_frames);
-        std::clog << "[async] queue=" << prof_queue / n << "ms  detect=" << prof_detect / n
-                  << "ms  pnp=" << prof_pnp / n << "ms  ekf=" << prof_ekf / n
-                  << "ms  latency=" << prof_latency / n << "ms\n";
-        prof_queue = prof_detect = prof_pnp = prof_ekf = prof_latency = 0.0;
+        const double process_avg = prof_process / n;
+        const double process_other =
+            std::max(0.0, process_avg - (prof_detect + prof_att + prof_solve + prof_aim) / n);
+        const double cycle_avg = prof_cycle / n;
+        const double cycle_other =
+            std::max(0.0, cycle_avg - (prof_wait + prof_process + prof_csv + prof_cb) / n);
+        std::clog << "[async] cycle=" << cycle_avg << "ms wait=" << prof_wait / n << " process=" << process_avg
+                  << " (detect " << prof_detect / n << " / att " << prof_att / n << " / solve " << prof_solve / n
+                  << " / aim " << prof_aim / n << " / other " << process_other << ") csv=" << prof_csv / n
+                  << " cb=" << prof_cb / n << " other=" << cycle_other << " | queue=" << prof_queue / n
+                  << " lat=" << prof_latency / n << "ms\n";
+        prof_cycle = prof_wait = prof_process = prof_csv = prof_cb = 0.0;
+        prof_queue = prof_detect = prof_att = prof_solve = prof_aim = prof_latency = 0.0;
         prof_frames = 0;
       }
     }
@@ -402,15 +487,24 @@ void RealtimePipeline::debugLoop(std::stop_token stop_token) {
   uint64_t seen = debug_slot_.seq();
   DebugFrame debug;
   double total_ms = 0.0;
+  double total_wait = 0.0;
+  double total_cycle = 0.0;
   int frames = 0;
+  double prev_cycle_start = -1.0;
 
   while (running_.load() && !stop_token.stop_requested()) {
+    const double cycle_start = steadyNowSeconds();
     if (!debug_slot_.waitNewer(seen, debug, stop_token)) break;
+    const double wait_done = steadyNowSeconds();
     const double draw_ms = drawDebugFrame(debug.frame->frame, debug.result);
     total_ms += draw_ms;
+    total_wait += (wait_done - cycle_start) * 1000.0;
+    if (prev_cycle_start >= 0.0) total_cycle += (cycle_start - prev_cycle_start) * 1000.0;
+    prev_cycle_start = cycle_start;
     if (++frames >= 50) {
-      std::clog << "[draw] 平均 " << total_ms / frames << "ms/帧（画图+imshow+waitKey）\n";
-      total_ms = 0.0;
+      std::clog << "[draw] 平均 " << total_ms / frames << "ms/帧（画图+imshow+waitKey） wait="
+                << total_wait / frames << "ms cycle=" << total_cycle / frames << "ms\n";
+      total_ms = total_wait = total_cycle = 0.0;
       frames = 0;
     }
   }
@@ -583,6 +677,9 @@ PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame&
       std::lock_guard<std::mutex> lock(stats_mutex_);
       ++stats_.dropped_frames;
     }
+    result.attitude_wait_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - attitude_wait_start).count();
+    result.dropped = true;
     return result;
   } else {
     // 作用：姿态到手，标记本帧反馈可用。实现：置 true。
@@ -637,6 +734,7 @@ PipelineFrameResult RealtimePipeline::processFrame(const core::TimestampedFrame&
                      processing.detect_timings.postprocess_ms;
   result.pnp_ms = processing.pnp_ms;
   result.ekf_ms = processing.ekf_ms;
+  result.solve_ms = processing.solve_ms;
 
   // 作用：把原始观测原样留一份给外部落盘，标定 R 靠它。实现：逐条拷成轻量记录。
   for (const auto& observation : processing.observations) {

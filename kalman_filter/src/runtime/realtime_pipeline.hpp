@@ -92,6 +92,10 @@ struct PipelineFrameResult {
   double ekf_ms{};
   // P0 埋点：瞄准解算 + 串口下发耗时，毫秒。只在开了 send/debug_log 时统计。
   double aim_ms{};
+  // 作用：processor_.solve 整体墙钟（predict + gray + 细化 + PnP + EKF），毫秒。
+  double solve_ms{};
+  // 作用：本帧是否因姿态等待失败被丢弃，profile 跳过这种短帧避免污染均值。
+  bool dropped{};
 };
 
 // 作用：调试线程的输入：帧 + 本帧完整结果。实现：画图只在 debug 线程做，

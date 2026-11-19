@@ -13,7 +13,7 @@ struct KalmanConfig {
   // 单板看旋转目标时位置和 yaw 会互相抢：滤波器宁愿平移车心也不转 yaw。
   // 10/50 仍能跟住机动，但把车心钉住得多。
   double p_coord = 20;
-  double p_yaw = 50;
+  double p_yaw = 225;
   double p_r{1e-6};
   // Δr/Δz 只在 id 奇偶切换时才被约束，可观测性弱，噪声给得远小于位置速度，
   // 相当于强先验：允许缓慢修正，不许乱跑。
