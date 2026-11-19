@@ -163,6 +163,13 @@ struct TimingConfig {
   double replay_imu_offset_seconds{0.009};
 };
 
+// 实时流水线拓扑。
+struct PipelineConfig {
+  // true：capture 线程只负责取帧，perception 线程做检测 + PnP + EKF。
+  // false：退回单线程内联，行为和 P3 之前一致，用于现场 A/B 和回放回归。
+  bool async{true};
+};
+
 struct AppConfig {
   RunMode mode{RunMode::Replay};
 
@@ -176,6 +183,7 @@ struct AppConfig {
   SerialConfig serial;
   TimingConfig timing;
   ControlConfig control;
+  PipelineConfig pipeline;
   // EKF 的运动/观测噪声，可用 --p-coord / --p-yaw / --pos-noise / --yaw-noise 现场调。
   kalfilter::KalmanConfig kalman;
 

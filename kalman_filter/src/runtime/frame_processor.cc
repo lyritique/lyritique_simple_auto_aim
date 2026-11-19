@@ -10,6 +10,11 @@
 namespace realtime {
 namespace {
 
+// P0 埋点：统一取上位机单调钟的秒数，和 realtime_pipeline 里的同源。
+double steadyNowSeconds() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // 作用：把相机系 XYZ 测量折成方位角、俯仰角、距离，喂给 EKF 用。实现：atan2 求水平角，hypot 求俯仰角，欧氏范数求距离。
 void computeYPD(const Eigen::Matrix<double, 4, 1>& measurement, kalfilter::cam_ypd& ypd) {
   // 作用：水平方位角，x 与 z 的夹角。实现：atan2(x, z)，自带象限判断。
@@ -103,7 +108,11 @@ detector::ArmorDetections FrameProcessor::detect(const core::TimestampedFrame& f
               << intrinsics_.height << " 不一致，PnP 结果可能不准\n";
   }
 
-  return detector_.detect(frame.bgr);
+  auto detections = detector_.detect(frame.bgr);
+  // P0：检测器自己记了三段耗时，结束时刻由这里补上，solve() 会消费掉。
+  last_detect_timings_ = detector_.timings();
+  last_detect_done_time_ = steadyNowSeconds();
+  return detections;
 }
 
 // 作用：拿检测结果做客位姿和滤波。实现：补一次预测，逐块细化 + PnP，按距离筛选后送进 EKF。
@@ -112,7 +121,17 @@ FrameProcessingResult FrameProcessor::solve(const core::TimestampedFrame& frame,
   // 作用：先把这一帧的结果容器准备好，各字段默认零值。实现：栈上默认构造。
   FrameProcessingResult result;
   result.detections = detections;
-  const auto profile_frame_start = std::chrono::steady_clock::now();
+  // P0：detect() 留下的埋点只消费一次，防止下一帧复用旧值。
+  result.detect_timings = last_detect_timings_;
+  result.detect_done_time = last_detect_done_time_;
+  const detector::DetectTimings detect_timings = last_detect_timings_;
+  last_detect_timings_ = {};
+  last_detect_done_time_ = 0.0;
+  const auto elapsedMs = [](const auto& from, const auto& to) {
+    return std::chrono::duration<double, std::milli>(to - from).count();
+  };
+  const auto solve_start = std::chrono::steady_clock::now();
+  double ekf_predict_ms = 0.0;
 
   // 作用：只有上过战场才知道该走多远，首帧不预测。实现：已初始化且有上帧时间才继续。
   if (ekf_initialized_ && has_last_frame_time_) {
@@ -120,7 +139,9 @@ FrameProcessingResult FrameProcessor::solve(const core::TimestampedFrame& frame,
     const double dt = frame.timestamp - last_frame_time_;
     // 作用：dt 必须正常，否则预测等于扔骰子。实现：有限且为正才调用 ekf_.predict。
     if (std::isfinite(dt) && dt > 0.0) {
+      const auto predict_start = std::chrono::steady_clock::now();
       ekf_.predict(dt);
+      ekf_predict_ms = elapsedMs(predict_start, std::chrono::steady_clock::now());
     }
   }
 
@@ -130,19 +151,31 @@ FrameProcessingResult FrameProcessor::solve(const core::TimestampedFrame& frame,
 
   // 作用：准备灰度图，亚像素细化只吃它。实现：cvtColor 做 BGR2GRAY。
   cv::Mat gray;
+  const auto gray_start = std::chrono::steady_clock::now();
   cv::cvtColor(frame.bgr, gray, cv::COLOR_BGR2GRAY);
+  const double gray_ms = elapsedMs(gray_start, std::chrono::steady_clock::now());
 
   // 作用：逐块板子过堂，能算位姿的才留。实现：遍历检测结果，内部完成细化、PnP、距离筛选和 EKF 投喂。
+  // P0：pnp_ms / ekf_ms 只统计耗时，不改变任何调用顺序；last_pnp_done_time 记最后一块板子解完的时刻。
+  double pnp_ms = 0.0;
+  double ekf_ms = 0.0;
+  double refine_ms = 0.0;
+  double pnp_solve_ms = 0.0;
+  double last_pnp_done_time = 0.0;
   for (const auto& detection : result.detections) {
+    const auto pnp_start = std::chrono::steady_clock::now();
     // 作用：用第一条边估板子多大，决定细化窗口开多大。实现：两个角点求范数。
     const double edge_length = cv::norm(detection.corners[0] - detection.corners[1]);
     // 作用：按板子尺寸自适应窗口，近处开大点、远处开小点。实现：边长乘 0.08 取整后夹到 [2,5]。
     const int half_window = std::clamp(static_cast<int>(std::lround(edge_length * 0.08F)), 2, 5);
 
     // 作用：拿到亚像素角点，最多允许挪 2 像素。实现：调 refineArmorCorners，窗口用上面的自适应尺寸。
+    const auto refine_start = std::chrono::steady_clock::now();
     const auto refined = refineArmorCorners(gray, detection.corners, 2.0F, cv::Size(half_window, half_window));
+    refine_ms += elapsedMs(refine_start, std::chrono::steady_clock::now());
 
     // 作用：先用原始角点算一版位姿，当对照组。实现：input + easySolver + getOutput 三连。
+    const auto pnp_solve_start = std::chrono::steady_clock::now();
     pnp_.input(detection.corners, detection.big);
     pnp_.easySolver();
     const pnp::PnPResult raw_pose = pnp_.getOutput();
@@ -151,11 +184,15 @@ FrameProcessingResult FrameProcessor::solve(const core::TimestampedFrame& frame,
     pnp_.input(refined, detection.big);
     pnp_.easySolver();
     const pnp::PnPResult refined_pose = pnp_.getOutput();
+    pnp_solve_ms += elapsedMs(pnp_solve_start, std::chrono::steady_clock::now());
 
     // 作用：择优录取：细化版有效且误差明显更小才用它。实现：误差要领先 0.03 才换，防止两版半斤八两瞎折腾。
     const bool use_refined = refined_pose.valid && (!raw_pose.valid || refined_pose.err + 0.03 < raw_pose.err);
     // 作用：定下最终位姿，后面都基于它。实现：三目选一个。
     const pnp::PnPResult pose = use_refined ? refined_pose : raw_pose;
+    // P0：不管这块最终用不用，细化 + 两版解算的耗时都要算进 PnP 阶段。
+    pnp_ms += elapsedMs(pnp_start, std::chrono::steady_clock::now());
+    last_pnp_done_time = steadyNowSeconds();
     // 作用：两版都失败就放弃这块板子，别拿垃圾喂滤波。实现：invalid 直接 continue。
     if (!pose.valid) continue;
 
@@ -194,24 +231,31 @@ FrameProcessingResult FrameProcessor::solve(const core::TimestampedFrame& frame,
     result.observations.push_back(observation);
 
     // 作用：滤波器还没出生就先给它第一口饭。实现：初次观测调 init，置标志后直接 break，本帧不再 update。
+    // P0：只测耗时，init/update 的调用顺序和次数保持原样。
+    const auto ekf_start = std::chrono::steady_clock::now();
     if (!ekf_initialized_) {
       ekf_.init(ekf_input);
       ekf_initialized_ = true;
+      ekf_ms += elapsedMs(ekf_start, std::chrono::steady_clock::now());
       break;
     }
 
     // 作用：已初始化就正常更新，只拿一块板子更新一次，避免同帧重复喂。实现：update 后打个空行当调试分隔。
     // 第四参传这块板的正对程度，斜视板的法向方位角误差按 1/cos 放大（见 computeR）。
     ekf_.update(ekf_input, ypd, R_C0C, frontalRatio(refined, detection.big));
+    ekf_ms += elapsedMs(ekf_start, std::chrono::steady_clock::now());
   }
 
   // 作用：把初始化状态汇报出去，外部据此判断要不要信任结果。实现：拷贝成员标志。
   result.ekf_initialized = ekf_initialized_;
   // 作用：滤波器活着就顺带刷新装甲板列表并导出状态。实现：renewArmorList 后取 getOutput，valid 一并透传。
+  double renew_ms = 0.0;
   if (ekf_initialized_) {
+    const auto renew_start = std::chrono::steady_clock::now();
     ekf_.renewArmorList();
     result.state = ekf_.getOutput();
     result.state_valid = result.state.valid;
+    renew_ms = elapsedMs(renew_start, std::chrono::steady_clock::now());
 
     // 作用：丢目标超时后整体复位，等下一帧重新初始化。
     // 实现：状态不可信就 reset 并清掉时间记忆；否则它会一直外推，
@@ -223,31 +267,56 @@ FrameProcessingResult FrameProcessor::solve(const core::TimestampedFrame& frame,
     }
   }
 
+  // P0：把本帧埋点交出去。pnp_done_time 是最后一块板子解完的时刻，ekf_done_time 是整个 EKF 阶段结束。
+  const double solve_ms = elapsedMs(solve_start, std::chrono::steady_clock::now());
+  result.pnp_ms = pnp_ms;
+  result.ekf_ms = ekf_ms;
+  result.pnp_done_time = last_pnp_done_time;
+  result.ekf_done_time = steadyNowSeconds();
+  result.solve_ms = solve_ms;
+  result.ekf_predict_ms = ekf_predict_ms;
+  result.gray_ms = gray_ms;
+  result.refine_ms = refine_ms;
+  result.pnp_solve_ms = pnp_solve_ms;
+  result.renew_ms = renew_ms;
+
   // 作用：每 50 帧打一次分段平均，判断该砍推理还是砍后处理。实现：累加后打印并清零。
   if (profile_) {
-    const auto to_ms = [](const auto& from, const auto& to) {
-      return std::chrono::duration<double, std::milli>(to - from).count();
-    };
-    // 检测耗时来自检测器自己记的三段，解算耗时取 solve 的墙钟。
-    const double detect_ms =
-        detector_.timings().preprocess_ms + detector_.timings().inference_ms + detector_.timings().postprocess_ms;
-    const double solve_ms = to_ms(profile_frame_start, std::chrono::steady_clock::now());
+    // 检测耗时来自 detect() 拷下来的三段，解算耗时取 solve 的墙钟。
+    const double detect_ms = detect_timings.preprocess_ms + detect_timings.inference_ms + detect_timings.postprocess_ms;
 
     profile_detect_ += detect_ms;
-    profile_pre_ += detector_.timings().preprocess_ms;
-    profile_inf_ += detector_.timings().inference_ms;
-    profile_post_ += detector_.timings().postprocess_ms;
-    profile_rest_ += solve_ms;
+    profile_pre_ += detect_timings.preprocess_ms;
+    profile_inf_ += detect_timings.inference_ms;
+    profile_post_ += detect_timings.postprocess_ms;
+    profile_solve_ += solve_ms;
+    profile_pnp_ += pnp_ms;
+    profile_ekf_ += ekf_ms;
+    profile_predict_ += ekf_predict_ms;
+    profile_gray_ += gray_ms;
+    profile_refine_ += refine_ms;
+    profile_pnp_solve_ += pnp_solve_ms;
+    profile_renew_ += renew_ms;
     ++profile_frames_;
 
     if (profile_frames_ >= 50) {
       const double n = static_cast<double>(profile_frames_);
+      const double solve_avg = profile_solve_ / n;
+      const double accounted = (profile_predict_ + profile_gray_ + profile_refine_ + profile_pnp_solve_ + profile_ekf_ +
+                                profile_renew_) / n;
+      const double other = std::max(0.0, solve_avg - accounted);
       std::clog << "[profile] detect=" << profile_detect_ / n << "ms (pre " << profile_pre_ / n << " / inf "
-                << profile_inf_ / n << " / post " << profile_post_ / n << ") solve=" << profile_rest_ / n
-                << "ms total=" << (profile_detect_ + profile_rest_) / n << "ms\n";
+                << profile_inf_ / n << " / post " << profile_post_ / n << ") solve=" << solve_avg << "ms (pred "
+                << profile_predict_ / n << " / gray " << profile_gray_ / n << " / refine " << profile_refine_ / n
+                << " / pnp " << profile_pnp_solve_ / n << " / ekf " << profile_ekf_ / n << " / renew "
+                << profile_renew_ / n << " / other " << other << ") pnp_all=" << profile_pnp_ / n
+                << "ms total=" << (profile_detect_ + profile_solve_) / n << "ms\n";
       profile_frames_ = 0;
       profile_detect_ = profile_pre_ = profile_inf_ = 0.0;
-      profile_post_ = profile_rest_ = 0.0;
+      profile_post_ = profile_solve_ = 0.0;
+      profile_pnp_ = profile_ekf_ = 0.0;
+      profile_predict_ = profile_gray_ = profile_refine_ = 0.0;
+      profile_pnp_solve_ = profile_renew_ = 0.0;
     }
   }
 

@@ -108,6 +108,13 @@ LatencyStats LatencyEstimator::summarize(const std::deque<double>& values) {
   std::nth_element(sorted.begin(), middle, sorted.end());
   // 作用：落袋为安。实现：解引用 middle 赋给 median。
   stats.median = *middle;
+
+  // 作用：p95 直接在同一份副本上再取一次下标，避免重复排序。实现：夹住末尾下标后 nth_element。
+  const auto p95_index =
+      std::min(static_cast<std::ptrdiff_t>((sorted.size() * 95) / 100), static_cast<std::ptrdiff_t>(sorted.size() - 1));
+  const auto p95_it = sorted.begin() + p95_index;
+  std::nth_element(sorted.begin(), p95_it, sorted.end());
+  stats.p95 = *p95_it;
   return stats;
 }
 

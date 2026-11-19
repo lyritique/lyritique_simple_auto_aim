@@ -85,14 +85,25 @@ int runLive(const core::AppConfig& config) {
 
   // 作用：打一份流水账，看看收了多少、丢了多少。实现：取 stats 快照后一次性输出四个计数。
   const auto stats = pipeline->stats();
-  std::cout << "实时模式结束: frames=" << stats.processed_frames << " valid=" << stats.valid_frames
-            << " dropped=" << stats.dropped_frames << " feedback=" << stats.received_feedback;
+  std::cout << "实时模式结束: captured=" << stats.captured_frames << " processed=" << stats.processed_frames
+            << " valid=" << stats.valid_frames << " dropped=" << stats.dropped_frames
+            << " skipped=" << stats.perception_skipped << " feedback=" << stats.received_feedback;
   // 作用：把时长和帧率一起打出来，取帧积压和时钟漂移才分得清。实现：elapsed 大于 0 才做除法。
   if (elapsed > 0.0) {
     std::cout << std::fixed << std::setprecision(2) << " 用时=" << elapsed
-              << "s 帧率=" << static_cast<double>(stats.processed_frames) / elapsed << "fps";
+              << "s 帧率=" << static_cast<double>(stats.processed_frames) / elapsed
+              << "fps 反馈=" << static_cast<double>(stats.received_feedback) / elapsed << "Hz";
   }
   std::cout << '\n';
+
+  // P0：退出时把处理延迟分布打出来，均值容易被少数样本带偏，重点看 median / p95 / max。
+  const auto latency = pipeline->latencySnapshot();
+  if (latency.process.sample_count > 0) {
+    const auto to_ms = [](double seconds) { return seconds * 1e3; };
+    std::cout << std::fixed << std::setprecision(2) << "处理延迟(曝光→指令就绪) ms: mean=" << to_ms(latency.process.mean)
+              << " median=" << to_ms(latency.process.median) << " p95=" << to_ms(latency.process.p95)
+              << " max=" << to_ms(latency.process.maximum) << " 样本=" << latency.process.sample_count << '\n';
+  }
   return 0;
 }
 

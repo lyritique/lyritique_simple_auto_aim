@@ -1,5 +1,7 @@
 #include "runtime/replay_pipeline.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -109,10 +111,24 @@ bool ReplayPipeline::run(std::string* error) {
 
     // 作用：复用同一帧对象，减少每轮构造。实现：循环外声明。
     core::TimestampedFrame source_frame;
+
+    // 作用：回放各段耗时累计器，够 50 帧打一行。实现：循环外局部变量，只有本线程读写。
+    double prof_read = 0.0;
+    double prof_imu = 0.0;
+    double prof_process = 0.0;
+    double prof_draw = 0.0;
+    double prof_csv = 0.0;
+    double prof_display = 0.0;
+    double prof_encode = 0.0;
+    double prof_cycle = 0.0;
+    int prof_frames = 0;
+
     // 作用：一帧一帧读到视频末尾。实现：无限循环里靠 FrameReadStatus 决定继续还是退出。
     for (;;) {
+      const auto cycle_start = std::chrono::steady_clock::now();
       // 作用：从视频源取下一帧。实现：read 返回状态码，End 就跳出。
       const auto status = source->read(source_frame, error);
+      const auto read_done = std::chrono::steady_clock::now();
       if (status == core::FrameReadStatus::End) break;
       // 作用：读帧失败要留个明白话，别让人猜。实现：状态非 Ok 时补错误信息再返回。
       if (status != core::FrameReadStatus::Ok) {
@@ -127,12 +143,19 @@ bool ReplayPipeline::run(std::string* error) {
       // 作用：把视频相对时间换成 IMU 的绝对时间。实现：起始时间加帧时间戳。
       const double image_time = video_start_time + source_frame.timestamp;
       // 作用：取该时刻的 IMU 姿态，同样按配置补一个固定偏移。实现：alignImuToImage。
+      const auto imu_start = std::chrono::steady_clock::now();
       const auto imu_k = replay::alignImuToImage(imu_data, image_time, config_.timing.replay_imu_offset_seconds);
       // 作用：算从基准姿态到当前姿态的相对旋转，给算法世界用。实现：R_0 转置乘当前旋转。
       const Eigen::Matrix3d R = R_0.transpose() * toMatrix(imu_k.q);
+      const auto imu_done = std::chrono::steady_clock::now();
 
       // 作用：这一帧正式进入检测和滤波流水线。实现：processor.process 带帧和旋转矩阵。
+      const auto process_start = std::chrono::steady_clock::now();
       const FrameProcessingResult processing = processor.process(source_frame, R);
+      const auto process_done = std::chrono::steady_clock::now();
+
+      const auto draw_start = std::chrono::steady_clock::now();
+      double csv_ms = 0.0;
       // 作用：把检测框画到图上，肉眼验证检测效果。实现：drawDetections。
       draw::drawDetections(frame, processing.detections);
 
@@ -145,9 +168,11 @@ bool ReplayPipeline::run(std::string* error) {
           cv::circle(frame, point, 2, cv::Scalar(255, 0, 255), 10);
         }
         if (observation_csv) {
+          const auto csv_start = std::chrono::steady_clock::now();
           observation_csv << image_time << ',' << observation.ypd.azi << ',' << observation.ypd.ele << ','
                           << observation.ypd.dist << ',' << observation.ekf_yaw << ',' << observation.pose.err << ','
                           << (observation.sent_to_ekf ? 1 : 0) << "\r\n";
+          csv_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - csv_start).count();
         }
       }
 
@@ -158,6 +183,9 @@ bool ReplayPipeline::run(std::string* error) {
       if (output.valid) {
         draw::drawFourArmorReprojections(frame, output, R, processor.cameraMatrix(), processor.distortionCoeffs(), false);
       }
+      const double draw_block_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - draw_start).count();
+      double draw_ms = std::max(0.0, draw_block_ms - csv_ms);
 
       // 作用：离线验证瞄准解算，只看角度跟不跟得上，不发任何东西。实现：0.5 s 打一行。
       if (config_.control.debug_log && output.valid &&
@@ -175,6 +203,7 @@ bool ReplayPipeline::run(std::string* error) {
       }
 
       // 作用：把本帧结果写进 CSV，无效帧单独标注。实现：invalid 就写“偏离过大”，否则写时间、11 维状态和重投影误差。
+      const auto state_csv_start = std::chrono::steady_clock::now();
       if (!output.valid) {
         csv << image_time << "偏离过大" << "\r\n";
       } else {
@@ -187,17 +216,56 @@ bool ReplayPipeline::run(std::string* error) {
         }
         csv << "\r\n";
       }
+      csv_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state_csv_start).count();
 
       // 作用：把状态文字和这一帧一起写进输出视频。实现：先 drawStateText，再 writer.write。
+      const auto state_text_start = std::chrono::steady_clock::now();
       draw::drawStateText(frame, output);
+      draw_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - state_text_start).count();
 
       // 作用：调试开关打开就把画完四面装甲板重投影的画面弹到屏幕上。实现：imshow + waitKey(1) 泵一下 GUI 事件。
+      double display_ms = 0.0;
       if (config_.debug_draw) {
+        const auto display_start = std::chrono::steady_clock::now();
         cv::imshow("debug draw", frame);
         cv::waitKey(1);
+        display_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - display_start).count();
       }
 
+      const auto encode_start = std::chrono::steady_clock::now();
       writer.write(frame);
+      const auto cycle_done = std::chrono::steady_clock::now();
+
+      if (config_.profile) {
+        const auto to_ms = [](const auto& a, const auto& b) {
+          return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        const double read_ms = to_ms(cycle_start, read_done);
+        const double imu_ms = to_ms(imu_start, imu_done);
+        const double process_ms = to_ms(process_start, process_done);
+        const double encode_ms = to_ms(encode_start, cycle_done);
+        prof_read += read_ms;
+        prof_imu += imu_ms;
+        prof_process += process_ms;
+        prof_draw += draw_ms;
+        prof_csv += csv_ms;
+        prof_display += display_ms;
+        prof_encode += encode_ms;
+        prof_cycle += to_ms(cycle_start, cycle_done);
+        if (++prof_frames >= 50) {
+          const double n = static_cast<double>(prof_frames);
+          const double cycle_avg = prof_cycle / n;
+          const double accounted =
+              (prof_read + prof_imu + prof_process + prof_draw + prof_csv + prof_display + prof_encode) / n;
+          std::clog << "[replay] cycle=" << cycle_avg << "ms read=" << prof_read / n << " imu=" << prof_imu / n
+                    << " process=" << prof_process / n << " draw=" << prof_draw / n << " csv=" << prof_csv / n
+                    << " display=" << prof_display / n << " encode=" << prof_encode / n
+                    << " other=" << std::max(0.0, cycle_avg - accounted) << "ms\n";
+          prof_read = prof_imu = prof_process = prof_draw = 0.0;
+          prof_csv = prof_display = prof_encode = prof_cycle = 0.0;
+          prof_frames = 0;
+        }
+      }
     }
 
     // 作用：调试窗口用完得拆掉，不然进程退出后窗口还挂着。实现：开关打开时 destroyWindow。
