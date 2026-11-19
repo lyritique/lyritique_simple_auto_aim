@@ -25,7 +25,7 @@ struct KalmanConfig {
   double ele{0.063};
   double azi{0.063};
   double k_dist{0.05};
-  double yaw{0.3};
+  double yaw{0.1};
   // 板子斜视时法向方位角的误差按 1/cos(斜视角) 放大，这是放大后的上限。
   // 10 rad/s 目标的大部分时间都只有一块快立起来的板在画面里，它的 yaw 基本是随机数；
   // 但也不能放大到无穷，位置那三行还要靠它把车心钉住。
