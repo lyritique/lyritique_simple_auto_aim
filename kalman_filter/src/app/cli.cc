@@ -518,6 +518,11 @@ CliResult parseCommandLine(int argc, char** argv) {
       result.config.profile = true;
       continue;
     }
+    // 作用：关闭 capture/perception 两线程，退回单线程内联。实现：pipeline.async 置假。
+    if (arg == "--sync-pipeline") {
+      result.config.pipeline.async = false;
+      continue;
+    }
     // 作用：把画好重投影的帧显示到屏幕，肉眼检查位姿。实现：debug_draw 置真。
     if (arg == "--debug-draw") {
       result.config.debug_draw = true;
@@ -647,7 +652,8 @@ void printUsage(std::ostream& out) {
          "  --level-pitch-offset DEG  相机相对云台的固定安装俯仰，度\n"
          "  --log-observations    把每块装甲板的原始观测量写入 observations.csv\n"
          "  --profile             每 50 帧打印一次各阶段平均耗时\n"
-         "  --debug-draw          回放时 cvshow 带检测框和重投影的画面\n"
+         "  --sync-pipeline       关闭 capture/perception 两线程，退回单线程内联\n"
+         "  --debug-draw          回放/实时 cvshow 带检测框和重投影的画面\n"
          "  --score-threshold F   检测置信度阈值，默认 0.5；现场目标小/暗时往低调\n"
          "  --detector-backend B  auto / trt / cuda / cpu，默认 auto（TensorRT→CUDA→CPU）\n"
          "  --no-fp16             关闭 TensorRT FP16\n"

@@ -3,9 +3,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
@@ -14,6 +16,7 @@
 #include "core/config.hpp"
 #include "core/frame.hpp"
 #include "runtime/frame_processor.hpp"
+#include "runtime/latest_slot.hpp"
 #include "sensors/camera_source.hpp"
 #include "timing/clock_sync.hpp"
 #include "timing/gimbal_history.hpp"
@@ -21,11 +24,23 @@
 #include "transport/protocol.hpp"
 #include "transport/serial_link.hpp"
 
-// 成员与线程职责、start 的资源回滚、读帧循环、姿态等待、反馈线程、时钟同步入库
+// capture/perception 线程、帧槽、状态发布、同步内联回退、CSV 与调试线程
 
 namespace realtime {
 
 using RealtimePipelineConfig = core::AppConfig;
+
+// 作用：一帧的完整所有权包。实现：capture 线程把 bgr 拷贝成独占 buffer，
+// 之后用 shared_ptr 在 perception/debug 之间共享，不再重复拷贝图像。
+struct FramePacket {
+  core::TimestampedFrame frame;
+  // 作用：capture 序号，从 1 开始递增，用来发现中间被槽覆盖掉的帧。
+  uint64_t seq{};
+  // 作用：read() 返回的真实收帧时刻（steady 秒），延迟统计用。
+  double read_done_time{};
+  // 作用：拷贝完成、可以交给 perception 的时刻（steady 秒），算排队等待用。
+  double ready_time{};
+};
 
 // 作用：一条原始观测记录，只用于标定观测噪声，不参与滤波。实现：YPD 加朝向角。
 struct ObservationRecord {
@@ -49,7 +64,8 @@ struct PipelineFrameResult {
   bool feedback_available{};
   // 作用：EKF 状态能不能信。实现：透传 processing.state_valid。
   bool state_valid{};
-  // 作用：本帧画图 + imshow 的耗时，毫秒；没开 debug_draw 时为 0。实现：画图前后取 steady 时钟差值。
+  // 作用：本帧画图 + imshow 的耗时，毫秒；没开 debug_draw 时为 0。
+  // 实现：由同步循环或 debug 线程在画完后填写。
   double draw_ms{};
 
   // 作用：EKF 的最终状态整包。实现：直接拷贝 processing.state。
@@ -57,6 +73,14 @@ struct PipelineFrameResult {
 
   // 作用：本帧所有原始观测，标定 R 时用。实现：从 FrameObservation 逐条拷成轻量记录。
   std::vector<ObservationRecord> observations;
+
+  // 作用：本帧检测框，画图用。实现：从 processing.detections 拷贝。
+  detector::ArmorDetections detections;
+  // 作用：相机系到算法世界的旋转，画四面重投影要用。实现：processFrame 里算出的 R_C0C。
+  Eigen::Matrix3d R_C0C{Eigen::Matrix3d::Identity()};
+
+  // 作用：从 capture 打包完成到 perception 开始处理的等待，毫秒。只有异步链路会非零。
+  double queue_wait_ms{};
 
   // P0 埋点：等云台姿态覆盖到帧时刻的耗时，毫秒；无 IMU 时为 0。
   double attitude_wait_ms{};
@@ -70,13 +94,24 @@ struct PipelineFrameResult {
   double aim_ms{};
 };
 
+// 作用：调试线程的输入：帧 + 本帧完整结果。实现：画图只在 debug 线程做，
+// 感知线程只发布最新一份，画不过来就覆盖，绝不反压感知。
+struct DebugFrame {
+  std::shared_ptr<const FramePacket> frame;
+  PipelineFrameResult result;
+};
+
 struct PipelineStats {
   // 作用：累计收到多少条 C 板反馈。实现：handleFeedback 成功入库后自增。
   uint64_t received_feedback{};
+  // 作用：累计从相机拿到多少帧。实现：capture 线程成功 read 后自增。
+  uint64_t captured_frames{};
   // 作用：累计处理了多少帧。实现：processFrame 进门先自增。
   uint64_t processed_frames{};
   // 作用：累计丢了多少帧。实现：读图失败或姿态等待超时都会加一。
   uint64_t dropped_frames{};
+  // 作用：capture 进槽后被覆盖、没进 perception 的帧数。实现：按 packet->seq 差值累计。
+  uint64_t perception_skipped{};
   // 作用：累计有多少帧产出了有效状态。实现：EKF 已初始化且 state.valid 才自增。
   uint64_t valid_frames{};
   // 作用：累计有多少帧的姿态是靠外推补的。实现：waitForAttitude 走 predict 分支时自增。
@@ -87,11 +122,14 @@ struct PipelineStats {
 using FrameCallback = std::function<void(const core::TimestampedFrame&, const PipelineFrameResult&)>;
 
 /*
- * 实时链路：
- * C 板反馈线程 -> ClockSync -> GimbalFeedbackHistory
- * MVS 相机帧 -> 按曝光/到达时间插值姿态 -> PnP -> EKF
+ * 实时链路（P3 起默认异步）：
+ *   capture 线程：相机 read -> 独占帧 -> LatestSlot
+ *   perception 线程：取最新帧 -> 检测 -> 姿态插值 -> PnP -> EKF -> 下发
+ *   debug 线程（可选）：最新帧 + 结果 -> 画图 / imshow
+ *   feedback 线程：串口收包 -> ClockSync -> GimbalFeedbackHistory
  *
- * 当前版本不自动发送控制指令；send() 留给后续弹道和控制层。
+ * pipeline.async=false 时退回单线程内联，行为和 P3 之前一致。
+ * EKF 仍然只由 perception 线程访问，每帧一次 predict、最多一次 update。
  */
 class RealtimePipeline {
  public:
@@ -140,11 +178,31 @@ class RealtimePipeline {
   const RealtimePipelineConfig& config() const noexcept { return config_; }
 
  private:
-  // 作用：一帧的完整加工：等姿态、算相对旋转、跑处理、记延迟、回调。实现：内部按顺序调用各组件，失败就计数返回。
-  // 参数：frame —— 已读出的帧；frame_received_time —— read() 返回时刻（steady 秒），P0 埋点用；
-  //      callback —— 外部回调，可空。返回：本帧结果，姿态等不到时各字段保持默认。
-  PipelineFrameResult processFrame(const core::TimestampedFrame& frame, double frame_received_time,
-                                   const FrameCallback& callback);
+  // 作用：一帧的完整加工：等姿态、算相对旋转、跑处理、记延迟。
+  // 实现：内部按顺序调用各组件，失败就计数返回；画图和回调由调用方负责。
+  // 参数：frame —— 已读出的帧；frame_received_time —— read() 返回时刻（steady 秒）。
+  // 返回：本帧结果，姿态等不到时各字段保持默认。
+  PipelineFrameResult processFrame(const core::TimestampedFrame& frame, double frame_received_time);
+
+  // 作用：同步内联路径，行为和 P3 之前一致。实现：读帧 -> processFrame -> CSV -> 画图 -> 回调。
+  void runSyncLoop(const std::atomic_bool& external_stop, const FrameCallback& callback);
+  // 作用：异步路径的等待端。实现：起 capture/perception/debug 线程，然后等外部停止。
+  void runAsyncLoop(const std::atomic_bool& external_stop, FrameCallback callback);
+  // 作用：capture 线程：只读帧并打包。实现：read -> clone 独占 -> 填序号 -> 发布到帧槽。
+  void captureLoop(std::stop_token stop_token);
+  // 作用：perception 线程：检测 + 滤波 + 下发。实现：等新帧 -> processFrame -> CSV -> 发布调试帧。
+  void perceptionLoop(std::stop_token stop_token);
+  // 作用：调试线程：只做画图和 imshow。实现：等新调试帧 -> 画 -> 显示，慢就丢。
+  void debugLoop(std::stop_token stop_token);
+
+  // 作用：把一帧画成调试画面并显示，返回耗时毫秒。实现：检测框 + 四面重投影 + 状态文字。
+  double drawDebugFrame(const core::TimestampedFrame& frame, const PipelineFrameResult& result) const;
+  // 作用：写 realtime.csv / observations.csv。实现：只有一个写者（同步循环或 perception）。
+  void writeCsv(const PipelineFrameResult& result);
+  // 作用：打开 CSV 并写表头。实现：每次 start 重新建目录、截断文件；打不开就静默跳过。
+  void openCsv();
+  // 作用：关闭 CSV。实现：stop 时在所有写者 join 之后调用。
+  void closeCsv();
   // 作用：等云台历史覆盖到目标时刻，最多等配置的毫秒数。实现：循环尝试插值，睡 1ms 再试，超时或停机就放弃。
   // 参数：host_time —— 要查的时刻；sample —— 输出姿态。返回：true 拿到姿态，false 超时或链路已停。
   bool waitForAttitude(double host_time, kalfilter::GimbalSample& sample);
@@ -186,13 +244,29 @@ class RealtimePipeline {
   double last_aim_log_time_{-1.0};
   // 作用：发送失败只报一次，别每帧刷屏。实现：失败置真，成功清掉。
   bool send_error_reported_{};
-  // 作用：首条 C 板反馈只打印一次。实现：打过后置真。
-  bool has_feedback_log_{};
+  // 作用：首条 C 板反馈只打印一次。实现：feedback 线程写、perception 线程读，用 atomic。
+  std::atomic_bool has_feedback_log_{false};
 
-  // 作用：运行开关，主循环和反馈线程都盯着它。实现：atomic bool，start 置真、stop 置假。
+  // 作用：运行开关，所有线程都盯着它。实现：atomic bool，start 置真、stop 置假。
   std::atomic_bool running_{false};
   // 作用：后台收包线程的把手。实现：std::jthread，start 时创建，stop 时请求停止并 join。
   std::jthread feedback_thread_;
+
+  // 异步流水线的线程把手。stop() 的 join 顺序：capture -> perception -> debug -> feedback。
+  std::jthread capture_thread_;
+  std::jthread perception_thread_;
+  std::jthread debug_thread_;
+
+  // 作用：帧槽只保留最新一帧。实现：LatestSlot 覆盖写，perception 慢了就丢旧帧，不排队。
+  LatestSlot<std::shared_ptr<const FramePacket>> frame_slot_;
+  // 作用：调试帧槽只保留最新一份。实现：画图慢只会掉显示帧，不反压 perception。
+  LatestSlot<DebugFrame> debug_slot_;
+  // 作用：run() 传进来的每帧回调。实现：只在 perception 线程调用，启动前赋值。
+  FrameCallback frame_callback_;
+
+  // 作用：实时 CSV 输出。实现：异步时 perception 写，同步时 run 写，始终只有一个写者。
+  std::ofstream realtime_csv_;
+  std::ofstream observation_csv_;
 
   // 作用：保护最新状态，写滤波线程、读外部线程。实现：mutable mutex，读写都先 lock。
   mutable std::mutex state_mutex_;
@@ -214,7 +288,8 @@ class RealtimePipeline {
   // 作用：作为世界系基准的初始姿态，之后都用它算相对旋转。实现：Eigen 四元数，首帧赋值。
   Eigen::Quaterniond q_init_{Eigen::Quaterniond::Identity()};
 
-  // 作用：留下最后一条错误信息，方便事后查账。实现：std::string，fail() 里覆盖。
+  // 作用：留下最后一条错误信息，方便事后查账。实现：capture 和 perception 都可能写，用锁保护。
+  mutable std::mutex error_mutex_;
   std::string last_error_;
 };
 
