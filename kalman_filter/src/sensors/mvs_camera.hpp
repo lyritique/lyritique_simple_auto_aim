@@ -86,6 +86,12 @@ class MvsCamera final : public CameraSource {
   uint64_t stale_dropped_{};
   // 排空探测的错误码只打印一次，避免刷屏。
   bool drain_probe_logged_{};
+  // 设备水印时标（sec/cyc/off）全 0 时只提示一次，别每帧刷屏。
+  bool watermark_reported_{};
+  // 上一帧的收帧时刻，给 timing_log 打印真实帧间隔用。
+  double last_recv_time_{};
+  // 上一帧的设备戳，给 timing_log 打印戳自己认为的帧间隔用。
+  std::uint64_t last_device_ticks_{};
   // 取流策略是否已切成 LatestImagesOnly；切成后由 SDK 清旧帧，不用再手动排空。
   bool grab_latest_only_{};
   std::vector<std::uint64_t> calib_ticks_;

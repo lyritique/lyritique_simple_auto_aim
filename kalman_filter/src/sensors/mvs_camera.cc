@@ -604,10 +604,28 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
     }
   }
   last_frame_timestamp_ = stamp;
+  last_recv_time_ = host_time;
+  last_device_ticks_ = device_ticks;
 
   if (config_.timing_log) {
+    // dt_us 是相邻两帧的**真实**到达间隔，dev_us 是戳自己认为的间隔。
+    // 两者相等 = 戳可信；dev_us 恒定而 dt_us 变了 = 戳是名义帧率算出来的。
+    const double dt_us = last_recv_time_ > 0.0 ? (host_time - last_recv_time_) * 1e6 : 0.0;
+    const double dev_us = last_device_ticks_ > 0 && device_ticks > last_device_ticks_
+                              ? static_cast<double>(device_ticks - last_device_ticks_) * clock_scale_ * 1e6
+                              : 0.0;
     std::clog << "[帧] n=" << info.nFrameNum << " dev=" << device_ticks << " mapped=" << stamp << " recv=" << host_time
-              << " lag_us=" << (host_time - stamp) * 1e6 << " exp_us=" << exposure_us << '\n';
+              << " lag_us=" << (host_time - stamp) * 1e6 << " exp_us=" << exposure_us << " dt_us=" << dt_us
+              << " dev_us=" << dev_us << '\n';
+    // 设备水印时标：sec/cyc/off 是 GevTimestamp 的分解形式，跟 dev 是两个独立字段。
+    // U3V 实测全 0（这条传输层没填），所以只在第一次和有值时打印，避免每帧刷屏。
+    const bool has_watermark = info.nSecondCount != 0 || info.nCycleCount != 0 || info.nCycleOffset != 0;
+    if (has_watermark || !watermark_reported_) {
+      watermark_reported_ = true;
+      std::clog << "[时标] n=" << info.nFrameNum << " sec=" << info.nSecondCount << " cyc=" << info.nCycleCount
+                << " off=" << info.nCycleOffset << " frmcnt=" << info.nFrameCounter << " trg=" << info.nTriggerIndex
+                << " host_ts=" << info.nHostTimeStamp << (has_watermark ? "" : "（全 0，本传输层不提供）") << '\n';
+    }
   }
 
   // 时间戳三件套，各说各话，别混着算：
@@ -775,6 +793,17 @@ bool MvsCamera::calibrateDeviceClock(std::string* error) {
   clock_ready_ = true;
   std::clog << "[相机时钟] 节点对齐 ns/tick=" << clock_scale_ * 1e9 << (via_latch ? "（锁存）" : "（直读）")
             << " 样本=" << offsets.size() << " 抖动=" << clock_spread_ms_ << "ms\n";
+
+  // 相机自己报的 tick 频率，拿来和上面用的 clock_scale_ 对账：
+  // 如果节点说 125 MHz 而我们按 10 ns/tick 算，说明 tick_ns 这个常数是拍的。
+  MVCC_INTVALUE_EX tick_freq{};
+  if (MV_CC_GetIntValueEx(handle_, "GevTimestampTickFrequency", &tick_freq) == MV_OK && tick_freq.nCurValue > 0) {
+    const double node_ns = 1e9 / static_cast<double>(tick_freq.nCurValue);
+    std::clog << "[相机时钟] 节点 TickFrequency=" << tick_freq.nCurValue << "（" << node_ns << " ns/tick），实际按 "
+              << clock_scale_ * 1e9 << " ns/tick 算\n";
+  } else {
+    std::clog << "[相机时钟] 节点 TickFrequency 不可用\n";
+  }
   return true;
 }
 
