@@ -574,6 +574,22 @@ CliResult parseCommandLine(int argc, char** argv) {
         result.error = "无效的 ns/tick: " + *value;
         break;
       }
+      // 显式钉死斜率就是不信任在线拟合，两者只能选一个。
+      result.config.camera.clock_fit = false;
+      continue;
+    }
+    // 作用：开关设备戳的在线斜率拟合。实现：字符串二分写 camera.clock_fit。
+    if (arg == "--camera-clock-fit") {
+      const auto* value = requireValue();
+      if (!value) break;
+      if (*value == "on") {
+        result.config.camera.clock_fit = true;
+      } else if (*value == "off") {
+        result.config.camera.clock_fit = false;
+      } else {
+        result.error = "clock-fit 只能是 on 或 off: " + *value;
+        break;
+      }
       continue;
     }
     // 作用：加载外部标定文件，覆盖内置内参。实现：调 loadIntrinsicsFile，失败就把错误塞进 error 并停止解析。
@@ -646,7 +662,8 @@ void printUsage(std::ostream& out) {
          "  --no-chunk-exposure   关闭 Chunk-Exposure，不读每帧曝光\n"
          "  --camera-timing-log   打印时钟校准结果和每帧时间戳\n"
          "  --camera-calib-seconds S  设备时钟校准窗口，标定 ns/tick 时给几百秒\n"
-         "  --camera-tick-ns NS   每 tick 纳秒数，默认 10（相机 100 MHz），不用改\n"
+         "  --camera-tick-ns NS   每 tick 纳秒数，只在先验位置用；显式给出会关掉在线拟合\n"
+         "  --camera-clock-fit S  on / off，在线拟合设备戳斜率，默认 on\n"
          "  --no-imu              不用 C 板姿态，假定云台静止（串口可不接）\n"
          "  --level-pitch-sign F  C 板 pitch 正方向，抬头为正是 1，低头报正传 -1\n"
          "  --level-pitch-offset DEG  相机相对云台的固定安装俯仰，度\n"

@@ -555,6 +555,7 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
       clock_offset_ = best;
       clock_spread_ms_ = 0.0;
       clock_ready_ = true;
+      device_clock_.reset(clock_scale_, clock_offset_);
       // ns/tick 默认就是固定值。收帧时刻估出来的斜率只做参考，
       // 它受取帧积压影响能偏到 8%，打出来容易误导人，只在显式要标定时才显示。
       std::clog << "[相机时钟] 校准完成 ns/tick=" << clock_scale_ * 1e9
@@ -571,11 +572,38 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
     }
   }
 
+  // 当前滞后：收帧时刻 - 映射时刻。拟合的冻结判据和报警都用它。
+  const double lag =
+      (clock_ready_ && device_ticks != 0) ? host_time - deviceTicksToHost(device_ticks) : 0.0;
+
+  // 在线标定设备戳斜率。
+  // 这台相机的戳是「帧号 × 设定帧率」算出来的名义时间，增量恒为 1,667,091 tick，
+  // 相机只跑到 56 fps 时也不变，于是按 10 ns/tick 映射出来的时刻会以 6~7%/s 往前漂。
+  // 这里用收帧时刻把真实斜率量出来，换斜率时 device_clock_ 内部会重锚 offset 保证连续。
+  if (config_.clock_fit && config_.use_device_timestamp && clock_ready_ && device_ticks != 0 &&
+      !host_stamp_fallback_) {
+    device_clock_.push(device_ticks, host_time);
+    const DeviceClock::Report report = device_clock_.update(device_ticks, lag);
+    if (report.updated) {
+      clock_scale_ = device_clock_.scale();
+      clock_offset_ = device_clock_.offset();
+      // 前几次更新必打，之后每 600 帧（约 10 s）打一行。
+      if (++fit_updates_ == 1 || fit_updates_ % 600 == 0) {
+        std::clog << "[相机时钟] 在线拟合 ns/tick=" << clock_scale_ * 1e9 << "（窗口 " << report.samples
+                  << " 帧，残差 " << report.residual_ms << " ms，本窗 " << report.fit_scale * 1e9 << "）\n";
+      }
+    }
+    if (report.model_broken) {
+      host_stamp_fallback_ = true;
+      std::clog << "警告: 设备戳和收帧时刻不成线性（残差 " << report.residual_ms
+                << " ms），本进程改用收帧时刻\n";
+    }
+  }
+
   // 滞后一路涨说明两件事之一：相机晶振和主机不一致（比例算错了），
   // 或者取帧跟不上、SDK 内部积压（那是真延迟）。两者都会让预测偏，
   // 但修法完全不同，所以先报警让人别当成正常现象。
   if (clock_ready_ && device_ticks != 0 && last_host_time_ > 0.0) {
-    const double lag = host_time - (deviceTicksToHost(device_ticks));
     if (lag > 0.1 && lag - last_warned_lag_ > 0.05) {
       last_warned_lag_ = lag;
       std::clog << "警告: 帧时间戳滞后 " << lag * 1000.0 << " ms 且持续增大，检查相机取帧是否积压\n";
@@ -584,7 +612,7 @@ core::FrameReadStatus MvsCamera::read(CameraFrame& frame, std::string* error) {
   if (clock_ready_) last_host_time_ = host_time;
 
   double stamp = host_time;
-  if (config_.use_device_timestamp && clock_ready_ && device_ticks != 0) {
+  if (config_.use_device_timestamp && clock_ready_ && device_ticks != 0 && !host_stamp_fallback_) {
     stamp = deviceTicksToHost(device_ticks);
 
     // anchor=0 表示戳在曝光开始，0.5 在中点，1 在结束。
@@ -684,6 +712,8 @@ void MvsCamera::close() {
   calib_hosts_.clear();
   calib_seconds_ = 0.0;
   last_frame_timestamp_ = 0.0;
+  host_stamp_fallback_ = false;
+  fit_updates_ = 0;
 }
 
 bool MvsCamera::latchDeviceTimestamp(uint64_t& ticks) {
@@ -791,6 +821,7 @@ bool MvsCamera::calibrateDeviceClock(std::string* error) {
   }
   clock_spread_ms_ = (offsets.back() - offsets.front()) * 1000.0;
   clock_ready_ = true;
+  device_clock_.reset(clock_scale_, clock_offset_);
   std::clog << "[相机时钟] 节点对齐 ns/tick=" << clock_scale_ * 1e9 << (via_latch ? "（锁存）" : "（直读）")
             << " 样本=" << offsets.size() << " 抖动=" << clock_spread_ms_ << "ms\n";
 

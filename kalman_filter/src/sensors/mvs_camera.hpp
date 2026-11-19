@@ -8,6 +8,7 @@
 
 #include "core/config.hpp"
 #include "sensors/camera_source.hpp"
+#include "sensors/device_clock.hpp"
 
 namespace camera {
 
@@ -104,6 +105,12 @@ class MvsCamera final : public CameraSource {
   double last_host_time_{};
   double last_warned_lag_{};
   double last_frame_timestamp_{};
+  // 设备戳斜率在线拟合。相机报的是「帧号 × 设定帧率」的名义时间，
+  // 跑不满设定帧率时会以百分比速率漂，见 device_clock.hpp。
+  DeviceClock device_clock_;
+  std::uint64_t fit_updates_{};
+  // 拟合判定模型不成立时置真，之后一律用收帧时刻，不再信设备戳。
+  bool host_stamp_fallback_{};
 };
 
 }  // namespace camera

@@ -50,6 +50,7 @@ add_executable(
     src/runtime/frame_processor.cc
     src/runtime/realtime_pipeline.cc
     src/runtime/replay_pipeline.cc
+    src/sensors/device_clock.cc
     src/sensors/mvs_camera.cc
     src/sensors/video_source.cc
     src/timing/clock_sync.cc
@@ -221,5 +222,17 @@ if(BUILD_TESTING)
         NAME aim_solver_test
         COMMAND aim_solver_test
     )
+
+    add_executable(
+        device_clock_test
+        tests/device_clock_test.cpp
+        src/sensors/device_clock.cc
+    )
+    target_include_directories(device_clock_test PRIVATE src/)
+    add_test(
+        NAME device_clock_test
+        COMMAND device_clock_test
+    )
+    set_tests_properties(device_clock_test PROPERTIES TIMEOUT 30)
 endif()
 
